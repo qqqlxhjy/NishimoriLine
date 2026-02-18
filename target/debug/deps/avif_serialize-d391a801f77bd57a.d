@@ -1,0 +1,10 @@
+/Users/EloimXiao/Documents/WORKSPACE/StatisticalPhysicsandInfo/target/debug/deps/avif_serialize-d391a801f77bd57a.d: /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/lib.rs /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/boxes.rs /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/constants.rs /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/writer.rs
+
+/Users/EloimXiao/Documents/WORKSPACE/StatisticalPhysicsandInfo/target/debug/deps/libavif_serialize-d391a801f77bd57a.rlib: /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/lib.rs /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/boxes.rs /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/constants.rs /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/writer.rs
+
+/Users/EloimXiao/Documents/WORKSPACE/StatisticalPhysicsandInfo/target/debug/deps/libavif_serialize-d391a801f77bd57a.rmeta: /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/lib.rs /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/boxes.rs /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/constants.rs /Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/writer.rs
+
+/Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/lib.rs:
+/Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/boxes.rs:
+/Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/constants.rs:
+/Users/EloimXiao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/avif-serialize-0.8.8/src/writer.rs:
