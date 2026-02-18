@@ -1,0 +1,11 @@
+# Rust-specific
+target/
+Cargo.lock
+
+# macOS-specific
+.DS_Store
+
+# Image outputs
+*.png
+*.jpg
+*.jpeg
