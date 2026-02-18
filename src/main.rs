@@ -12,6 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table},
     Terminal,
 };
+use chrono::Local;
 use std::io;
 
 // ─────────────────────────────────────────────
@@ -283,24 +284,31 @@ fn measure_at_temperature(p: &SimParams, temperature: f64, rng: &mut impl Rng) -
     let n = (p.l * p.l) as f64;
     let mut model = build_lattice(p, temperature);
 
-    // Thermalization
+    // Thermalization: each step is one full lattice sweep (L*L flip attempts)
     for _ in 0..p.therm_steps {
-        model.metropolis_step(rng);
+        for _ in 0..p.l * p.l {
+            model.metropolis_step(rng);
+        }
     }
 
-    // Measurement
+    // Measurement: each step is one full lattice sweep (L*L flip attempts)
     let mut e_samples: Vec<f64> = Vec::new();
     let mut m_samples: Vec<f64> = Vec::new();
+    let mut m_abs_samples: Vec<f64> = Vec::new();
     for step in 0..p.mc_steps {
-        model.metropolis_step(rng);
+        for _ in 0..p.l * p.l {
+            model.metropolis_step(rng);
+        }
         if step % p.stride == 0 {
             e_samples.push(model.total_energy());
-            m_samples.push(model.total_magnetization().unsigned_abs() as f64);
+            let m = model.total_magnetization() as f64;
+            m_samples.push(m);
+            m_abs_samples.push(m.abs());
         }
     }
 
     let mean_e   = mean(&e_samples) / n;
-    let mean_m   = mean(&m_samples) / n;
+    let mean_m   = mean(&m_abs_samples) / n;
     let heat_cap = variance(&e_samples) / (temperature * temperature * n);
     let chi      = variance(&m_samples) / (temperature * n);
 
@@ -369,8 +377,9 @@ fn draw_subplot(
 }
 
 fn save_plots(results: &[SimResult]) -> Result<(), Box<dyn std::error::Error>> {
-    let path = "ising_results.png";
-    let root = BitMapBackend::new(path, (1200, 900)).into_drawing_area();
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let filename = format!("ising_results_{}.png", timestamp);
+    let root = BitMapBackend::new(&filename, (1200, 900)).into_drawing_area();
     root.fill(&WHITE)?;
 
     let areas = root.split_evenly((2, 2));
@@ -519,7 +528,7 @@ fn draw_done(f: &mut ratatui::Frame<'_>, results: &[SimResult]) {
         "Simulation complete!\n\n\
          Temperatures computed : {}\n\
          T range               : {:.3} — {:.3}\n\n\
-         Results saved to: ising_results.png\n\n\
+         Results saved to: ising_results_<timestamp>.png\n\n\
          Press 'q' to quit.",
         results.len(), t0, t1
     );
