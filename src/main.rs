@@ -23,12 +23,14 @@ struct IsingModel {
     spins: Vec<Vec<i8>>,
     size: usize,
     j: f64,
+    j_horiz: Vec<Vec<f64>>,
+    j_vert: Vec<Vec<f64>>,
     h: f64,
     temperature: f64,
 }
 
 impl IsingModel {
-    fn new_random(size: usize, j: f64, h: f64, temperature: f64) -> Self {
+    fn new_random(size: usize, j: f64, p: f64, h: f64, temperature: f64) -> Self {
         let mut rng = rand::thread_rng();
         let spins = (0..size)
             .map(|_| {
@@ -37,25 +39,79 @@ impl IsingModel {
                     .collect()
             })
             .collect();
-        Self { spins, size, j, h, temperature }
+        let j_horiz = (0..size)
+            .map(|_| {
+                (0..size)
+                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
+                    .collect()
+            })
+            .collect();
+        let j_vert = (0..size)
+            .map(|_| {
+                (0..size)
+                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
+                    .collect()
+            })
+            .collect();
+        Self { spins, size, j, j_horiz, j_vert, h, temperature }
     }
 
-    fn new_all_up(size: usize, j: f64, h: f64, temperature: f64) -> Self {
-        Self { spins: vec![vec![1i8; size]; size], size, j, h, temperature }
+    fn new_all_up(size: usize, j: f64, p: f64, h: f64, temperature: f64) -> Self {
+        let spins = vec![vec![1i8; size]; size];
+        let mut rng = rand::thread_rng();
+        let j_horiz = (0..size)
+            .map(|_| {
+                (0..size)
+                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
+                    .collect()
+            })
+            .collect();
+        let j_vert = (0..size)
+            .map(|_| {
+                (0..size)
+                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
+                    .collect()
+            })
+            .collect();
+        Self { spins, size, j, j_horiz, j_vert, h, temperature }
     }
 
-    fn new_all_down(size: usize, j: f64, h: f64, temperature: f64) -> Self {
-        Self { spins: vec![vec![-1i8; size]; size], size, j, h, temperature }
+    fn new_all_down(size: usize, j: f64, p: f64, h: f64, temperature: f64) -> Self {
+        let spins = vec![vec![-1i8; size]; size];
+        let mut rng = rand::thread_rng();
+        let j_horiz = (0..size)
+            .map(|_| {
+                (0..size)
+                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
+                    .collect()
+            })
+            .collect();
+        let j_vert = (0..size)
+            .map(|_| {
+                (0..size)
+                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
+                    .collect()
+            })
+            .collect();
+        Self { spins, size, j, j_horiz, j_vert, h, temperature }
     }
 
     fn energy_at_site(&self, i: usize, jc: usize) -> f64 {
         let l = self.size;
         let spin = self.spins[i][jc] as f64;
-        let top    = self.spins[(i + l - 1) % l][jc] as f64;
-        let bottom = self.spins[(i + 1) % l][jc] as f64;
-        let left   = self.spins[i][(jc + l - 1) % l] as f64;
-        let right  = self.spins[i][(jc + 1) % l] as f64;
-        -self.j * spin * (top + bottom + left + right) - self.h * spin
+        let top_i = (i + l - 1) % l;
+        let bottom_i = (i + 1) % l;
+        let left_j = (jc + l - 1) % l;
+        let right_j = (jc + 1) % l;
+        let top = self.spins[top_i][jc] as f64;
+        let bottom = self.spins[bottom_i][jc] as f64;
+        let left = self.spins[i][left_j] as f64;
+        let right = self.spins[i][right_j] as f64;
+        let j_top = self.j_vert[top_i][jc];
+        let j_bottom = self.j_vert[i][jc];
+        let j_left = self.j_horiz[i][left_j];
+        let j_right = self.j_horiz[i][jc];
+        -spin * (j_top * top + j_bottom * bottom + j_left * left + j_right * right) - self.h * spin
     }
 
     fn total_energy(&self) -> f64 {
@@ -66,7 +122,10 @@ impl IsingModel {
                 let spin  = self.spins[i][jc] as f64;
                 let right  = self.spins[i][(jc + 1) % l] as f64;
                 let bottom = self.spins[(i + 1) % l][jc] as f64;
-                e -= self.j * spin * (right + bottom);
+                let j_right = self.j_horiz[i][jc];
+                let j_bottom = self.j_vert[i][jc];
+                e -= j_right * spin * right;
+                e -= j_bottom * spin * bottom;
             }
         }
         e - self.h * self.total_magnetization() as f64
@@ -129,10 +188,16 @@ impl InitialState {
 struct SimParams {
     l: usize,
     j: f64,
+    bond_p: f64,
     initial_state: InitialState,
     t_start: f64,
     t_end: f64,
     t_step: f64,
+    t_analysis_min: f64,
+    t_analysis_max: f64,
+    tc_min: f64,
+    tc_max: f64,
+    tc_step: f64,
     mc_steps: usize,
     therm_steps: usize,
     stride: usize,
@@ -145,10 +210,16 @@ impl Default for SimParams {
         Self {
             l: 32,
             j: 1.0,
+            bond_p: 0.0,
             initial_state: InitialState::Random,
             t_start: 1.0,
             t_end: 4.0,
             t_step: 0.1,
+            t_analysis_min: 2.0,
+            t_analysis_max: 2.3,
+            tc_min: 2.20,
+            tc_max: 2.40,
+            tc_step: 0.0001,
             mc_steps,
             therm_steps: mc_steps / 2,
             stride: 10,
@@ -169,17 +240,23 @@ struct SimResult {
 // App / TUI state
 // ─────────────────────────────────────────────
 
-const FIELD_L:          usize = 0;
-const FIELD_J:          usize = 1;
-const FIELD_INIT:       usize = 2;
-const FIELD_T_START:    usize = 3;
-const FIELD_T_END:      usize = 4;
-const FIELD_T_STEP:     usize = 5;
-const FIELD_MC_STEPS:   usize = 6;
-const FIELD_THERM:      usize = 7;
-const FIELD_STRIDE:     usize = 8;
-const FIELD_H:          usize = 9;
-const NUM_FIELDS:       usize = 10;
+const FIELD_L:              usize = 0;
+const FIELD_J:              usize = 1;
+const FIELD_P:              usize = 2;
+const FIELD_INIT:           usize = 3;
+const FIELD_T_START:        usize = 4;
+const FIELD_T_END:          usize = 5;
+const FIELD_T_STEP:         usize = 6;
+const FIELD_MC_STEPS:       usize = 7;
+const FIELD_THERM:          usize = 8;
+const FIELD_STRIDE:         usize = 9;
+const FIELD_H:              usize = 10;
+const FIELD_T_ANALYSIS_MIN: usize = 11;
+const FIELD_T_ANALYSIS_MAX: usize = 12;
+const FIELD_TC_MIN:         usize = 13;
+const FIELD_TC_MAX:         usize = 14;
+const FIELD_TC_STEP:        usize = 15;
+const NUM_FIELDS:           usize = 16;
 
 enum AppMode {
     Setup,
@@ -201,6 +278,7 @@ impl App {
         let mut b = vec![String::new(); NUM_FIELDS];
         b[FIELD_L]        = d.l.to_string();
         b[FIELD_J]        = format!("{}", d.j);
+        b[FIELD_P]        = format!("{}", d.bond_p);
         b[FIELD_T_START]  = format!("{}", d.t_start);
         b[FIELD_T_END]    = format!("{}", d.t_end);
         b[FIELD_T_STEP]   = format!("{}", d.t_step);
@@ -208,6 +286,11 @@ impl App {
         b[FIELD_THERM]    = d.therm_steps.to_string();
         b[FIELD_STRIDE]   = d.stride.to_string();
         b[FIELD_H]        = format!("{}", d.h);
+        b[FIELD_T_ANALYSIS_MIN] = format!("{}", d.t_analysis_min);
+        b[FIELD_T_ANALYSIS_MAX] = format!("{}", d.t_analysis_max);
+        b[FIELD_TC_MIN]         = format!("{}", d.tc_min);
+        b[FIELD_TC_MAX]         = format!("{}", d.tc_max);
+        b[FIELD_TC_STEP]        = format!("{}", d.tc_step);
         // FIELD_INIT uses initial_state directly
         Self {
             mode: AppMode::Setup,
@@ -226,6 +309,10 @@ impl App {
         let j = self.field_buffers[FIELD_J].trim().parse::<f64>()
             .map_err(|_| format!("J must be a number, got '{}'", self.field_buffers[FIELD_J]))?;
 
+        let bond_p = self.field_buffers[FIELD_P].trim().parse::<f64>()
+            .map_err(|_| format!("p must be a number, got '{}'", self.field_buffers[FIELD_P]))?;
+        if !(0.0..=1.0).contains(&bond_p) { return Err("p must be in [0, 1]".into()); }
+
         let t_start = self.field_buffers[FIELD_T_START].trim().parse::<f64>()
             .map_err(|_| format!("T start must be a number, got '{}'", self.field_buffers[FIELD_T_START]))?;
         if t_start <= 0.0 { return Err("T start must be > 0".into()); }
@@ -237,6 +324,30 @@ impl App {
         let t_step = self.field_buffers[FIELD_T_STEP].trim().parse::<f64>()
             .map_err(|_| format!("T step must be a number, got '{}'", self.field_buffers[FIELD_T_STEP]))?;
         if t_step <= 0.0 { return Err("T step must be > 0".into()); }
+
+        let t_analysis_min = self.field_buffers[FIELD_T_ANALYSIS_MIN].trim().parse::<f64>()
+            .map_err(|_| format!("Log-log T_min must be a number, got '{}'", self.field_buffers[FIELD_T_ANALYSIS_MIN]))?;
+
+        let t_analysis_max = self.field_buffers[FIELD_T_ANALYSIS_MAX].trim().parse::<f64>()
+            .map_err(|_| format!("Log-log T_max must be a number, got '{}'", self.field_buffers[FIELD_T_ANALYSIS_MAX]))?;
+        if t_analysis_max < t_analysis_min {
+            return Err("Log-log T_max must be >= Log-log T_min".into());
+        }
+
+        let tc_min = self.field_buffers[FIELD_TC_MIN].trim().parse::<f64>()
+            .map_err(|_| format!("Tc min must be a number, got '{}'", self.field_buffers[FIELD_TC_MIN]))?;
+
+        let tc_max = self.field_buffers[FIELD_TC_MAX].trim().parse::<f64>()
+            .map_err(|_| format!("Tc max must be a number, got '{}'", self.field_buffers[FIELD_TC_MAX]))?;
+        if tc_max <= tc_min {
+            return Err("Tc max must be > Tc min".into());
+        }
+
+        let tc_step = self.field_buffers[FIELD_TC_STEP].trim().parse::<f64>()
+            .map_err(|_| format!("Tc step must be a number, got '{}'", self.field_buffers[FIELD_TC_STEP]))?;
+        if tc_step <= 0.0 {
+            return Err("Tc step must be > 0".into());
+        }
 
         let mc_steps = self.field_buffers[FIELD_MC_STEPS].trim().parse::<usize>()
             .map_err(|_| format!("MC Steps must be a positive integer, got '{}'", self.field_buffers[FIELD_MC_STEPS]))?;
@@ -253,7 +364,24 @@ impl App {
         let h = self.field_buffers[FIELD_H].trim().parse::<f64>()
             .map_err(|_| format!("H must be a number, got '{}'", self.field_buffers[FIELD_H]))?;
 
-        Ok(SimParams { l, j, initial_state: self.initial_state, t_start, t_end, t_step, mc_steps, therm_steps, stride, h })
+        Ok(SimParams {
+            l,
+            j,
+            bond_p,
+            initial_state: self.initial_state,
+            t_start,
+            t_end,
+            t_step,
+            t_analysis_min,
+            t_analysis_max,
+            tc_min,
+            tc_max,
+            tc_step,
+            mc_steps,
+            therm_steps,
+            stride,
+            h,
+        })
     }
 }
 
@@ -274,9 +402,9 @@ fn variance(xs: &[f64]) -> f64 {
 
 fn build_lattice(p: &SimParams, temperature: f64) -> IsingModel {
     match p.initial_state {
-        InitialState::Random  => IsingModel::new_random(p.l, p.j, p.h, temperature),
-        InitialState::AllUp   => IsingModel::new_all_up(p.l, p.j, p.h, temperature),
-        InitialState::AllDown => IsingModel::new_all_down(p.l, p.j, p.h, temperature),
+        InitialState::Random  => IsingModel::new_random(p.l, p.j, p.bond_p, p.h, temperature),
+        InitialState::AllUp   => IsingModel::new_all_up(p.l, p.j, p.bond_p, p.h, temperature),
+        InitialState::AllDown => IsingModel::new_all_down(p.l, p.j, p.bond_p, p.h, temperature),
     }
 }
 
@@ -332,6 +460,238 @@ fn run_sweep(
         results.push(measure_at_temperature(params, t, &mut rng));
     }
     results
+}
+
+struct TcScanResult {
+    tc: f64,
+    beta: f64,
+    r_squared: f64,
+    slope: f64,
+    intercept: f64,
+    fit_points: usize,
+    is_valid: bool,
+}
+
+fn run_loglog_analysis(params: &SimParams, results: &[SimResult]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::Write;
+
+    if results.is_empty() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all("data")?;
+
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let prefix = format!("data/loglog_singleProfile_{}", timestamp);
+
+    {
+        let mut file = File::create(format!("{}_scan.csv", prefix))?;
+        writeln!(file, "temperature,e_per_spin,m_abs_per_spin,c_per_spin,susceptibility")?;
+        for r in results {
+            writeln!(
+                file,
+                "{:.8},{:.8},{:.8},{:.8},{:.8}",
+                r.temperature, r.mean_e, r.mean_m, r.heat_cap, r.susceptibility
+            )?;
+        }
+    }
+
+    let temps: Vec<f64> = results.iter().map(|r| r.temperature).collect();
+    let mags: Vec<f64> = results.iter().map(|r| r.mean_m).collect();
+
+    let t_min = params.t_analysis_min;
+    let t_max = params.t_analysis_max;
+
+    let mut tc_results = Vec::new();
+
+    let n_steps = ((params.tc_max - params.tc_min) / params.tc_step).round() as usize;
+    for i in 0..=n_steps {
+        let tc = params.tc_min + i as f64 * params.tc_step;
+        if tc < params.tc_min || tc > params.tc_max {
+            continue;
+        }
+
+        let mut x_vals = Vec::new();
+        let mut y_vals = Vec::new();
+
+        for (&t, &m) in temps.iter().zip(mags.iter()) {
+            if t < tc && t >= t_min && t <= t_max && m > 0.0 {
+                let x = (tc - t).ln();
+                let y = m.ln();
+                x_vals.push(x);
+                y_vals.push(y);
+            }
+        }
+
+        if x_vals.len() < 4 {
+            tc_results.push(TcScanResult {
+                tc,
+                beta: 0.0,
+                r_squared: f64::NEG_INFINITY,
+                slope: 0.0,
+                intercept: 0.0,
+                fit_points: x_vals.len(),
+                is_valid: false,
+            });
+            continue;
+        }
+
+        let n = x_vals.len() as f64;
+        let sum_x: f64 = x_vals.iter().sum();
+        let sum_y: f64 = y_vals.iter().sum();
+        let sum_x2: f64 = x_vals.iter().map(|x| x * x).sum();
+        let sum_xy: f64 = x_vals.iter().zip(y_vals.iter()).map(|(x, y)| x * y).sum();
+
+        let denominator = n * sum_x2 - sum_x * sum_x;
+        if denominator == 0.0 {
+            tc_results.push(TcScanResult {
+                tc,
+                beta: 0.0,
+                r_squared: f64::NEG_INFINITY,
+                slope: 0.0,
+                intercept: 0.0,
+                fit_points: x_vals.len(),
+                is_valid: false,
+            });
+            continue;
+        }
+
+        let slope = (n * sum_xy - sum_x * sum_y) / denominator;
+        let intercept = (sum_y - slope * sum_x) / n;
+
+        let mean_y = sum_y / n;
+        let ss_tot = y_vals.iter().map(|y| (y - mean_y).powi(2)).sum::<f64>();
+        let ss_res = y_vals
+            .iter()
+            .zip(x_vals.iter())
+            .map(|(y, x)| (y - (slope * x + intercept)).powi(2))
+            .sum::<f64>();
+        let r_squared = if ss_tot == 0.0 { 1.0 } else { 1.0 - (ss_res / ss_tot) };
+
+        let is_valid = slope > 0.0 && r_squared > 0.0 && r_squared <= 1.0;
+
+        tc_results.push(TcScanResult {
+            tc,
+            beta: slope,
+            r_squared,
+            slope,
+            intercept,
+            fit_points: x_vals.len(),
+            is_valid,
+        });
+    }
+
+    {
+        let mut file = File::create(format!("{}_tc_scan.csv", prefix))?;
+        writeln!(file, "tc,beta,r_squared,slope,intercept,fit_points,is_valid")?;
+        for r in &tc_results {
+            writeln!(
+                file,
+                "{:.8},{:.8},{:.8},{:.8},{:.8},{} ,{}",
+                r.tc, r.beta, r.r_squared, r.slope, r.intercept, r.fit_points, r.is_valid
+            )?;
+        }
+    }
+
+    let best = tc_results
+        .iter()
+        .filter(|r| r.is_valid && r.r_squared.is_finite() && r.r_squared > 0.0)
+        .max_by(|a, b| a.r_squared.partial_cmp(&b.r_squared).unwrap_or(std::cmp::Ordering::Equal));
+
+    {
+        let mut html = String::new();
+        html.push_str("<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>Tc log-log analysis</title></head>\n<body>\n");
+        html.push_str("<h1>Tc log-log analysis</h1>\n");
+        html.push_str(&format!(
+            "<p>T analysis window: [{:.6}, {:.6}]</p>\n",
+            t_min, t_max
+        ));
+        html.push_str(&format!(
+            "<p>Tc scan range: [{:.6}, {:.6}] step {:.6}</p>\n",
+            params.tc_min, params.tc_max, params.tc_step
+        ));
+        if let Some(b) = best {
+            html.push_str(&format!(
+                "<p>Best Tc: {:.8}, beta: {:.8}, R²: {:.8}, fit points: {}</p>\n",
+                b.tc, b.beta, b.r_squared, b.fit_points
+            ));
+        } else {
+            html.push_str("<p>No valid Tc found (no positive-slope fits with R²>0).</p>\n");
+        }
+        html.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"4\">\n");
+        html.push_str("<tr><th>Tc</th><th>beta</th><th>R²</th><th>slope</th><th>intercept</th><th>fit_points</th><th>valid</th></tr>\n");
+        for r in &tc_results {
+            let highlight = if best.map_or(false, |b| (b.tc - r.tc).abs() < 1e-10) {
+                " style=\"background-color:#ffffcc;\""
+            } else {
+                ""
+            };
+            html.push_str(&format!(
+                "<tr{}><td>{:.8}</td><td>{:.8}</td><td>{:.8}</td><td>{:.8}</td><td>{:.8}</td><td>{}</td><td>{}</td></tr>\n",
+                highlight, r.tc, r.beta, r.r_squared, r.slope, r.intercept, r.fit_points, r.is_valid
+            ));
+        }
+        html.push_str("</table>\n</body>\n</html>\n");
+
+        let mut file = File::create(format!("{}_loglog_detailed.html", prefix))?;
+        file.write_all(html.as_bytes())?;
+    }
+
+    if let Some(b) = best {
+        let mut x_vals = Vec::new();
+        let mut y_vals = Vec::new();
+        for (&t, &m) in temps.iter().zip(mags.iter()) {
+            if t < b.tc && t >= t_min && t <= t_max && m > 0.0 {
+                let x = (b.tc - t).ln();
+                let y = m.ln();
+                x_vals.push(x);
+                y_vals.push(y);
+            }
+        }
+        if !x_vals.is_empty() {
+            let x_min = x_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+            let x_max = x_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let y_min = y_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+            let y_max = y_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let x_pad = (x_max - x_min).abs() * 0.1 + 1e-10;
+            let y_pad = (y_max - y_min).abs() * 0.1 + 1e-10;
+
+            let path = format!("{}_loglog_plot.png", prefix);
+            let root = BitMapBackend::new(&path, (800, 600)).into_drawing_area();
+            root.fill(&WHITE)?;
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption("log(M) vs log(Tc - T)", ("sans-serif", 18).into_font())
+                .margin(20)
+                .x_label_area_size(40)
+                .y_label_area_size(60)
+                .build_cartesian_2d((x_min - x_pad)..(x_max + x_pad), (y_min - y_pad)..(y_max + y_pad))?;
+
+            chart.configure_mesh().x_desc("log(Tc - T)").y_desc("log(M)").draw()?;
+
+            chart.draw_series(
+                x_vals
+                    .iter()
+                    .zip(y_vals.iter())
+                    .map(|(&x, &y)| Circle::new((x, y), 4, BLUE.filled())),
+            )?;
+
+            let line_x0 = x_min - x_pad;
+            let line_x1 = x_max + x_pad;
+            let line_y0 = b.slope * line_x0 + b.intercept;
+            let line_y1 = b.slope * line_x1 + b.intercept;
+
+            chart.draw_series(LineSeries::new(
+                vec![(line_x0, line_y0), (line_x1, line_y1)],
+                &RED,
+            ))?;
+
+            root.present()?;
+        }
+    }
+
+    Ok(())
 }
 
 // ─────────────────────────────────────────────
@@ -427,6 +787,7 @@ fn draw_setup(f: &mut ratatui::Frame<'_>, app: &App) {
     let field_names = [
         "Lattice Size L",
         "Interaction J",
+        "Bond disorder p",
         "Initial State",
         "T start",
         "T end",
@@ -435,6 +796,11 @@ fn draw_setup(f: &mut ratatui::Frame<'_>, app: &App) {
         "Therm Steps (default: MC/2)",
         "Stride",
         "External Field H",
+        "Log-log T_min",
+        "Log-log T_max",
+        "Tc_min",
+        "Tc_max",
+        "Tc_step",
     ];
 
     let rows: Vec<Row> = field_names
@@ -613,9 +979,14 @@ fn handle_key(
                                 };
                                 let _ = terminal.draw(|f| draw_frame(f, app));
                             });
-                            // Generate plots
+                            // Generate plots and log-log analysis outputs
                             match save_plots(&results) {
-                                Ok(()) => app.mode = AppMode::Done(results),
+                                Ok(()) => {
+                                    if let Err(e) = run_loglog_analysis(&params, &results) {
+                                        app.error_msg = Some(format!("Log-log analysis error: {}", e));
+                                    }
+                                    app.mode = AppMode::Done(results);
+                                }
                                 Err(e) => {
                                     app.mode = AppMode::Setup;
                                     app.error_msg = Some(format!("Plot error: {}", e));
