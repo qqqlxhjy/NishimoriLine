@@ -137,10 +137,30 @@ pub fn load_params_from_summary_dir(dir: &str) -> Result<SimParams, String> {
     let t_step = t_step.ok_or_else(|| format!("Missing T_step in {}", path))?;
     let tc_step = tc_step.ok_or_else(|| format!("Missing Tc_step in {}", path))?;
 
+    let mut sample_count: usize = 1;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(eq_pos) = line.find('=') {
+            let key = line[..eq_pos].trim();
+            let val_str = line[eq_pos + 1..].trim();
+            if key == "Disorder samples" {
+                if let Ok(v) = val_str.parse::<usize>() {
+                    if v >= 1 {
+                        sample_count = v;
+                    }
+                }
+            }
+        }
+    }
+
     Ok(SimParams {
         l,
         j,
         bond_p,
+        sample_count,
         initial_state,
         t_start,
         t_end,
@@ -156,4 +176,3 @@ pub fn load_params_from_summary_dir(dir: &str) -> Result<SimParams, String> {
         h,
     })
 }
-

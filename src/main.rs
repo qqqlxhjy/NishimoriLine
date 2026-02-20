@@ -7,7 +7,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use plotters::prelude::*;
-use rand::Rng;
+use rand::{Rng, seq::SliceRandom};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -33,6 +33,41 @@ struct IsingModel {
 }
 
 impl IsingModel {
+    fn build_bonds(size: usize, j: f64, p: f64, rng: &mut impl Rng) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        let total_bonds = 2 * size * size;
+        let mut target_neg = (p * total_bonds as f64).round() as usize;
+        if target_neg > total_bonds {
+            target_neg = total_bonds;
+        }
+        let mut flags = vec![false; total_bonds];
+        for k in 0..target_neg {
+            flags[k] = true;
+        }
+        flags.shuffle(rng);
+        let mut iter = flags.into_iter();
+        let j_horiz = (0..size)
+            .map(|_| {
+                (0..size)
+                    .map(|_| {
+                        let is_neg = iter.next().unwrap_or(false);
+                        if is_neg { -j } else { j }
+                    })
+                    .collect()
+            })
+            .collect();
+        let j_vert = (0..size)
+            .map(|_| {
+                (0..size)
+                    .map(|_| {
+                        let is_neg = iter.next().unwrap_or(false);
+                        if is_neg { -j } else { j }
+                    })
+                    .collect()
+            })
+            .collect();
+        (j_horiz, j_vert)
+    }
+
     fn new_random(size: usize, j: f64, p: f64, h: f64, temperature: f64) -> Self {
         let mut rng = rand::thread_rng();
         let spins = (0..size)
@@ -42,60 +77,21 @@ impl IsingModel {
                     .collect()
             })
             .collect();
-        let j_horiz = (0..size)
-            .map(|_| {
-                (0..size)
-                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
-                    .collect()
-            })
-            .collect();
-        let j_vert = (0..size)
-            .map(|_| {
-                (0..size)
-                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
-                    .collect()
-            })
-            .collect();
+        let (j_horiz, j_vert) = Self::build_bonds(size, j, p, &mut rng);
         Self { spins, size, j, j_horiz, j_vert, h, temperature }
     }
 
     fn new_all_up(size: usize, j: f64, p: f64, h: f64, temperature: f64) -> Self {
         let spins = vec![vec![1i8; size]; size];
         let mut rng = rand::thread_rng();
-        let j_horiz = (0..size)
-            .map(|_| {
-                (0..size)
-                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
-                    .collect()
-            })
-            .collect();
-        let j_vert = (0..size)
-            .map(|_| {
-                (0..size)
-                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
-                    .collect()
-            })
-            .collect();
+        let (j_horiz, j_vert) = Self::build_bonds(size, j, p, &mut rng);
         Self { spins, size, j, j_horiz, j_vert, h, temperature }
     }
 
     fn new_all_down(size: usize, j: f64, p: f64, h: f64, temperature: f64) -> Self {
         let spins = vec![vec![-1i8; size]; size];
         let mut rng = rand::thread_rng();
-        let j_horiz = (0..size)
-            .map(|_| {
-                (0..size)
-                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
-                    .collect()
-            })
-            .collect();
-        let j_vert = (0..size)
-            .map(|_| {
-                (0..size)
-                    .map(|_| if rng.gen::<f64>() < p { -j } else { j })
-                    .collect()
-            })
-            .collect();
+        let (j_horiz, j_vert) = Self::build_bonds(size, j, p, &mut rng);
         Self { spins, size, j, j_horiz, j_vert, h, temperature }
     }
 
@@ -200,6 +196,7 @@ struct SimParams {
     l: usize,
     j: f64,
     bond_p: f64,
+    sample_count: usize,
     initial_state: InitialState,
     t_start: f64,
     t_end: f64,
@@ -222,6 +219,7 @@ impl Default for SimParams {
             l: 32,
             j: 1.0,
             bond_p: 0.0,
+            sample_count: 1,
             initial_state: InitialState::Random,
             t_start: 1.0,
             t_end: 4.0,
@@ -264,7 +262,24 @@ const FIELD_THERM:          usize = 8;
 const FIELD_STRIDE:         usize = 9;
 const FIELD_H:              usize = 10;
 const FIELD_TC_STEP:        usize = 11;
-const NUM_FIELDS:           usize = 12;
+const FIELD_SAMPLE_COUNT:   usize = 12;
+const NUM_FIELDS:           usize = 13;
+
+const FIELD_ORDER: [usize; NUM_FIELDS] = [
+    FIELD_L,
+    FIELD_J,
+    FIELD_P,
+    FIELD_INIT,
+    FIELD_H,
+    FIELD_T_START,
+    FIELD_T_END,
+    FIELD_T_STEP,
+    FIELD_TC_STEP,
+    FIELD_MC_STEPS,
+    FIELD_THERM,
+    FIELD_STRIDE,
+    FIELD_SAMPLE_COUNT,
+];
 
 enum AppMode {
     Setup,
@@ -311,6 +326,7 @@ impl App {
         b[FIELD_STRIDE]   = d.stride.to_string();
         b[FIELD_H]        = format!("{}", d.h);
         b[FIELD_TC_STEP]  = format!("{}", d.tc_step);
+        b[FIELD_SAMPLE_COUNT] = d.sample_count.to_string();
         Self {
             mode: AppMode::Setup,
             field_buffers: b,
@@ -371,10 +387,15 @@ impl App {
         let h = self.field_buffers[FIELD_H].trim().parse::<f64>()
             .map_err(|_| format!("H must be a number, got '{}'", self.field_buffers[FIELD_H]))?;
 
+        let sample_count = self.field_buffers[FIELD_SAMPLE_COUNT].trim().parse::<usize>()
+            .map_err(|_| format!("Disorder samples must be a positive integer, got '{}'", self.field_buffers[FIELD_SAMPLE_COUNT]))?;
+        if sample_count == 0 { return Err("Disorder samples must be >= 1".into()); }
+
         Ok(SimParams {
             l,
             j,
             bond_p,
+            sample_count,
             initial_state: self.initial_state,
             t_start,
             t_end,
@@ -417,35 +438,53 @@ fn build_lattice(p: &SimParams, temperature: f64) -> IsingModel {
 
 fn measure_at_temperature(p: &SimParams, temperature: f64, rng: &mut impl Rng) -> SimResult {
     let n = (p.l * p.l) as f64;
-    let mut model = build_lattice(p, temperature);
+    let mut mean_e_acc = 0.0;
+    let mut mean_m_acc = 0.0;
+    let mut heat_cap_acc = 0.0;
+    let mut chi_acc = 0.0;
 
-    // Thermalization: each step is one full lattice sweep (L*L flip attempts)
-    for _ in 0..p.therm_steps {
-        for _ in 0..p.l * p.l {
-            model.metropolis_step(rng);
+    let samples = p.sample_count.max(1);
+
+    for _ in 0..samples {
+        let mut model = build_lattice(p, temperature);
+
+        for _ in 0..p.therm_steps {
+            for _ in 0..p.l * p.l {
+                model.metropolis_step(rng);
+            }
         }
+
+        let mut e_samples: Vec<f64> = Vec::new();
+        let mut m_samples: Vec<f64> = Vec::new();
+        let mut m_abs_samples: Vec<f64> = Vec::new();
+        for step in 0..p.mc_steps {
+            for _ in 0..p.l * p.l {
+                model.metropolis_step(rng);
+            }
+            if step % p.stride == 0 {
+                e_samples.push(model.total_energy());
+                let m = model.total_magnetization() as f64;
+                m_samples.push(m);
+                m_abs_samples.push(m.abs());
+            }
+        }
+
+        let mean_e = mean(&e_samples) / n;
+        let mean_m = mean(&m_abs_samples) / n;
+        let heat_cap = variance(&e_samples) / (temperature * temperature * n);
+        let chi = variance(&m_samples) / (temperature * n);
+
+        mean_e_acc += mean_e;
+        mean_m_acc += mean_m;
+        heat_cap_acc += heat_cap;
+        chi_acc += chi;
     }
 
-    // Measurement: each step is one full lattice sweep (L*L flip attempts)
-    let mut e_samples: Vec<f64> = Vec::new();
-    let mut m_samples: Vec<f64> = Vec::new();
-    let mut m_abs_samples: Vec<f64> = Vec::new();
-    for step in 0..p.mc_steps {
-        for _ in 0..p.l * p.l {
-            model.metropolis_step(rng);
-        }
-        if step % p.stride == 0 {
-            e_samples.push(model.total_energy());
-            let m = model.total_magnetization() as f64;
-            m_samples.push(m);
-            m_abs_samples.push(m.abs());
-        }
-    }
-
-    let mean_e   = mean(&e_samples) / n;
-    let mean_m   = mean(&m_abs_samples) / n;
-    let heat_cap = variance(&e_samples) / (temperature * temperature * n);
-    let chi      = variance(&m_samples) / (temperature * n);
+    let inv_samples = 1.0 / samples as f64;
+    let mean_e = mean_e_acc * inv_samples;
+    let mean_m = mean_m_acc * inv_samples;
+    let heat_cap = heat_cap_acc * inv_samples;
+    let chi = chi_acc * inv_samples;
 
     SimResult { temperature, mean_e, mean_m, heat_cap, susceptibility: chi }
 }
@@ -718,11 +757,16 @@ fn run_loglog_analysis(
         writeln!(file, "p = {}", params.bond_p)?;
         writeln!(file, "H = {}", params.h)?;
         writeln!(file, "Initial state = {}", params.initial_state.label())?;
+        let total_bonds = 2usize.saturating_mul(params.l).saturating_mul(params.l);
+        let neg_target = (params.bond_p.max(0.0).min(1.0) * total_bonds as f64).round() as usize;
+        writeln!(file, "Total bonds = {}", total_bonds)?;
+        writeln!(file, "-J bonds (rigid) = {}", neg_target)?;
         writeln!(file)?;
         writeln!(file, "MC parameters")?;
         writeln!(file, "MC steps   = {}", params.mc_steps)?;
         writeln!(file, "Therm steps = {}", params.therm_steps)?;
         writeln!(file, "Stride      = {}", params.stride)?;
+        writeln!(file, "Disorder samples = {}", params.sample_count)?;
         writeln!(file)?;
         writeln!(file, "Scan parameters")?;
         writeln!(file, "T_start = {}", params.t_start)?;
@@ -814,12 +858,88 @@ fn save_overview_to_path(
     Ok(())
 }
 
-fn save_plots(results: &[SimResult]) -> Result<(), Box<dyn std::error::Error>> {
+fn save_bond_sample(params: &SimParams, dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if params.bond_p <= 0.0 {
+        return Ok(());
+    }
+    let size = params.l;
+    if size == 0 {
+        return Ok(());
+    }
+
+    let samples = params.sample_count.max(1);
+    let mut rng = rand::thread_rng();
+    let mut neg_horiz = vec![vec![0usize; size]; size];
+    let mut neg_vert = vec![vec![0usize; size]; size];
+
+    for _ in 0..samples {
+        let (j_h, j_v) = IsingModel::build_bonds(size, params.j, params.bond_p, &mut rng);
+        for i in 0..size {
+            for j in 0..size {
+                if j_h[i][j] < 0.0 {
+                    neg_horiz[i][j] += 1;
+                }
+                if j_v[i][j] < 0.0 {
+                    neg_vert[i][j] += 1;
+                }
+            }
+        }
+    }
+
+    let filename = format!("{}/bond_sample.png", dir);
+    let root = BitMapBackend::new(&filename, (800, 400)).into_drawing_area();
+    root.fill(&WHITE)?;
+    let areas = root.split_evenly((1, 2));
+
+    let draw_heatmap = |area: &DrawingArea<BitMapBackend, plotters::coord::Shift>,
+                        title: &str,
+                        counts: &Vec<Vec<usize>>|
+     -> Result<(), Box<dyn std::error::Error>> {
+        let n = size as i32;
+        let mut chart = ChartBuilder::on(area)
+            .caption(title, ("sans-serif", 18).into_font())
+            .margin(10)
+            .build_cartesian_2d(0..n, 0..n)?;
+
+        chart.configure_mesh().disable_x_mesh().disable_y_mesh().draw()?;
+
+        chart.draw_series((0..size).flat_map(|i| (0..size).map(move |j| (i, j))).map(
+            |(i, j)| {
+                let frac = counts[i][j] as f64 / samples as f64;
+                let intensity = (frac * 255.0).round().clamp(0.0, 255.0) as u8;
+                let color = RGBColor(255, 255 - intensity, 255 - intensity);
+                Rectangle::new(
+                    [(j as i32, i as i32), (j as i32 + 1, i as i32 + 1)],
+                    color.filled(),
+                )
+            },
+        ))?;
+
+        Ok(())
+    };
+
+    draw_heatmap(
+        &areas[0],
+        "Horizontal bonds: fraction of -J over samples",
+        &neg_horiz,
+    )?;
+    draw_heatmap(
+        &areas[1],
+        "Vertical bonds: fraction of -J over samples",
+        &neg_vert,
+    )?;
+    root.present()?;
+    Ok(())
+}
+
+fn save_plots(params: &SimParams, results: &[SimResult]) -> Result<(), Box<dyn std::error::Error>> {
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     let dir = format!("data/ising_results_{}", timestamp);
     std::fs::create_dir_all(&dir)?;
     let filename = format!("{}/ising_results.png", dir);
     save_overview_to_path(results, &filename)?;
+
+    save_bond_sample(params, &dir)?;
 
     let csv_path = format!("{}/ising_results_scan.csv", dir);
     {
@@ -872,6 +992,21 @@ fn draw_setup(f: &mut ratatui::Frame<'_>, app: &App) {
         ])
         .split(outer[1]);
 
+    let bonds_info = if let (Ok(l), Ok(p)) = (
+        app.field_buffers[FIELD_L].trim().parse::<usize>(),
+        app.field_buffers[FIELD_P].trim().parse::<f64>(),
+    ) {
+        if l > 0 {
+            let total_bonds = 2usize.saturating_mul(l).saturating_mul(l);
+            let neg_target = (p.max(0.0).min(1.0) * total_bonds as f64).round() as usize;
+            Some((total_bonds, neg_target))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let model_fields = [
         (FIELD_L, "Lattice Size L"),
         (FIELD_J, "Interaction J"),
@@ -891,6 +1026,7 @@ fn draw_setup(f: &mut ratatui::Frame<'_>, app: &App) {
         (FIELD_MC_STEPS, "MC Steps"),
         (FIELD_THERM, "Therm Steps (default: MC/2)"),
         (FIELD_STRIDE, "Stride"),
+        (FIELD_SAMPLE_COUNT, "Disorder samples (p>0)"),
     ];
 
     let build_rows = |fields: &[(usize, &str)], app: &App| {
@@ -924,7 +1060,20 @@ fn draw_setup(f: &mut ratatui::Frame<'_>, app: &App) {
             .collect::<Vec<Row>>()
     };
 
-    let model_rows = build_rows(&model_fields, app);
+    let mut model_rows = build_rows(&model_fields, app);
+    let bonds_row_style = Style::default().fg(TuiColor::Magenta).add_modifier(Modifier::BOLD);
+    let bonds_text = if let Some((total_bonds, neg_target)) = bonds_info {
+        format!(
+            "Total bonds = {},  -J bonds = {}",
+            total_bonds, neg_target
+        )
+    } else {
+        "Total bonds = N/A,  -J bonds = N/A".to_string()
+    };
+    model_rows.push(Row::new(vec![
+        Cell::from("Bond summary").style(bonds_row_style),
+        Cell::from(bonds_text).style(bonds_row_style),
+    ]));
     let scan_rows = build_rows(&scan_fields, app);
     let mc_rows = build_rows(&mc_fields, app);
 
@@ -943,7 +1092,6 @@ fn draw_setup(f: &mut ratatui::Frame<'_>, app: &App) {
         .column_spacing(2);
     f.render_widget(mc_table, param_areas[2]);
 
-    // Footer: error or hint
     let footer_text = app
         .error_msg
         .as_deref()
@@ -1329,6 +1477,7 @@ fn handle_key(
                             app.field_buffers[FIELD_STRIDE] = params.stride.to_string();
                             app.field_buffers[FIELD_H] = format!("{}", params.h);
                             app.field_buffers[FIELD_TC_STEP] = format!("{}", params.tc_step);
+                            app.field_buffers[FIELD_SAMPLE_COUNT] = params.sample_count.to_string();
                             app.selected_field = 0;
                             app.error_msg = None;
                             app.mode = AppMode::Setup;
@@ -1579,11 +1728,21 @@ fn handle_key(
                 }
 
                 KeyCode::Up => {
-                    app.selected_field = app.selected_field.saturating_sub(1);
+                    let pos = FIELD_ORDER
+                        .iter()
+                        .position(|&f| f == app.selected_field)
+                        .unwrap_or(0);
+                    let new_pos = pos.saturating_sub(1);
+                    app.selected_field = FIELD_ORDER[new_pos];
                     app.error_msg = None;
                 }
                 KeyCode::Down => {
-                    app.selected_field = (app.selected_field + 1).min(NUM_FIELDS - 1);
+                    let pos = FIELD_ORDER
+                        .iter()
+                        .position(|&f| f == app.selected_field)
+                        .unwrap_or(0);
+                    let new_pos = (pos + 1).min(NUM_FIELDS - 1);
+                    app.selected_field = FIELD_ORDER[new_pos];
                     app.error_msg = None;
                 }
 
@@ -1621,7 +1780,7 @@ fn handle_key(
                                 };
                                 let _ = terminal.draw(|f| draw_frame(f, app));
                             });
-                            match save_plots(&results) {
+                            match save_plots(&params, &results) {
                                 Ok(()) => {
                                     let temps: Vec<f64> =
                                         results.iter().map(|r| r.temperature).collect();
