@@ -1,0 +1,31 @@
+Simulation summary
+Timestamp: 20260220_130133
+Output directory: data/loglog_singleProfile_20260220_130133
+
+Model parameters
+L = 64
+J = 1
+p = 0
+H = 0
+Initial state = Random
+
+MC parameters
+MC steps   = 1500
+Therm steps = 2000
+Stride      = 1
+
+Scan parameters
+T_start = 1.5
+T_end   = 3.1
+T_step  = 0.05
+Tc_step = 0.0005
+
+Auto analysis windows
+T window (envelope) = [2.100000, 2.800000]
+Tc window (overlap)  = [2.100000, 2.700000]
+
+Best Tc from log-log fit
+Tc_best    = 2.30300000
+beta       = 0.16074016
+R_squared  = 0.99931625
+fit_points = 5

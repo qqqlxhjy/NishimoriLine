@@ -1,3 +1,6 @@
+mod autoanalysis;
+mod load_params;
+
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -168,6 +171,14 @@ impl InitialState {
             InitialState::AllDown => "All Down (-1)",
         }
     }
+    fn from_label(s: &str) -> Option<Self> {
+        match s.trim() {
+            "Random" => Some(InitialState::Random),
+            "All Up  (+1)" => Some(InitialState::AllUp),
+            "All Down (-1)" => Some(InitialState::AllDown),
+            _ => None,
+        }
+    }
     fn next(self) -> Self {
         match self {
             InitialState::Random  => InitialState::AllUp,
@@ -228,6 +239,7 @@ impl Default for SimParams {
     }
 }
 
+#[derive(Clone)]
 struct SimResult {
     temperature:   f64,
     mean_e:        f64, // <E>/N
@@ -251,25 +263,37 @@ const FIELD_MC_STEPS:       usize = 7;
 const FIELD_THERM:          usize = 8;
 const FIELD_STRIDE:         usize = 9;
 const FIELD_H:              usize = 10;
-const FIELD_T_ANALYSIS_MIN: usize = 11;
-const FIELD_T_ANALYSIS_MAX: usize = 12;
-const FIELD_TC_MIN:         usize = 13;
-const FIELD_TC_MAX:         usize = 14;
-const FIELD_TC_STEP:        usize = 15;
-const NUM_FIELDS:           usize = 16;
+const FIELD_TC_STEP:        usize = 11;
+const NUM_FIELDS:           usize = 12;
 
 enum AppMode {
     Setup,
-    Running { current_t: f64, t_end: f64, done: usize, total: usize },
-    Done(Vec<SimResult>),
+    LoadParams,
+    RunningSweep { current_t: f64, t_end: f64, done: usize, total: usize },
+    Step1Summary,
+    ManualWindowEdit,
+    RunningTcScan { done: usize, total: usize },
+    Done,
+}
+
+#[derive(Clone)]
+struct ManualWindowEditState {
+    fields:   [String; 4],
+    selected: usize,
 }
 
 struct App {
-    mode:           AppMode,
-    field_buffers:  Vec<String>,
-    selected_field: usize,
-    initial_state:  InitialState,
-    error_msg:      Option<String>,
+    mode:                 AppMode,
+    field_buffers:        Vec<String>,
+    selected_field:       usize,
+    initial_state:        InitialState,
+    error_msg:            Option<String>,
+    results:              Option<Vec<SimResult>>,
+    auto_intervals:       Option<autoanalysis::AutoAnalysisIntervals>,
+    sim_params:           Option<SimParams>,
+    manual_window_state:  Option<ManualWindowEditState>,
+    saved_runs:           Vec<(String, String)>,
+    saved_run_selected:   usize,
 }
 
 impl App {
@@ -286,18 +310,19 @@ impl App {
         b[FIELD_THERM]    = d.therm_steps.to_string();
         b[FIELD_STRIDE]   = d.stride.to_string();
         b[FIELD_H]        = format!("{}", d.h);
-        b[FIELD_T_ANALYSIS_MIN] = format!("{}", d.t_analysis_min);
-        b[FIELD_T_ANALYSIS_MAX] = format!("{}", d.t_analysis_max);
-        b[FIELD_TC_MIN]         = format!("{}", d.tc_min);
-        b[FIELD_TC_MAX]         = format!("{}", d.tc_max);
-        b[FIELD_TC_STEP]        = format!("{}", d.tc_step);
-        // FIELD_INIT uses initial_state directly
+        b[FIELD_TC_STEP]  = format!("{}", d.tc_step);
         Self {
             mode: AppMode::Setup,
             field_buffers: b,
             selected_field: 0,
             initial_state: d.initial_state,
             error_msg: None,
+            results: None,
+            auto_intervals: None,
+            sim_params: Some(d),
+            manual_window_state: None,
+            saved_runs: Vec::new(),
+            saved_run_selected: 0,
         }
     }
 
@@ -324,24 +349,6 @@ impl App {
         let t_step = self.field_buffers[FIELD_T_STEP].trim().parse::<f64>()
             .map_err(|_| format!("T step must be a number, got '{}'", self.field_buffers[FIELD_T_STEP]))?;
         if t_step <= 0.0 { return Err("T step must be > 0".into()); }
-
-        let t_analysis_min = self.field_buffers[FIELD_T_ANALYSIS_MIN].trim().parse::<f64>()
-            .map_err(|_| format!("Log-log T_min must be a number, got '{}'", self.field_buffers[FIELD_T_ANALYSIS_MIN]))?;
-
-        let t_analysis_max = self.field_buffers[FIELD_T_ANALYSIS_MAX].trim().parse::<f64>()
-            .map_err(|_| format!("Log-log T_max must be a number, got '{}'", self.field_buffers[FIELD_T_ANALYSIS_MAX]))?;
-        if t_analysis_max < t_analysis_min {
-            return Err("Log-log T_max must be >= Log-log T_min".into());
-        }
-
-        let tc_min = self.field_buffers[FIELD_TC_MIN].trim().parse::<f64>()
-            .map_err(|_| format!("Tc min must be a number, got '{}'", self.field_buffers[FIELD_TC_MIN]))?;
-
-        let tc_max = self.field_buffers[FIELD_TC_MAX].trim().parse::<f64>()
-            .map_err(|_| format!("Tc max must be a number, got '{}'", self.field_buffers[FIELD_TC_MAX]))?;
-        if tc_max <= tc_min {
-            return Err("Tc max must be > Tc min".into());
-        }
 
         let tc_step = self.field_buffers[FIELD_TC_STEP].trim().parse::<f64>()
             .map_err(|_| format!("Tc step must be a number, got '{}'", self.field_buffers[FIELD_TC_STEP]))?;
@@ -372,10 +379,10 @@ impl App {
             t_start,
             t_end,
             t_step,
-            t_analysis_min,
-            t_analysis_max,
-            tc_min,
-            tc_max,
+            t_analysis_min: t_start,
+            t_analysis_max: t_end,
+            tc_min: t_start,
+            tc_max: t_end,
             tc_step,
             mc_steps,
             therm_steps,
@@ -472,7 +479,11 @@ struct TcScanResult {
     is_valid: bool,
 }
 
-fn run_loglog_analysis(params: &SimParams, results: &[SimResult]) -> Result<(), Box<dyn std::error::Error>> {
+fn run_loglog_analysis(
+    params: &SimParams,
+    results: &[SimResult],
+    mut progress_cb: impl FnMut(usize, usize),
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::fs::File;
     use std::io::Write;
 
@@ -480,10 +491,10 @@ fn run_loglog_analysis(params: &SimParams, results: &[SimResult]) -> Result<(), 
         return Ok(());
     }
 
-    std::fs::create_dir_all("data")?;
-
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-    let prefix = format!("data/loglog_singleProfile_{}", timestamp);
+    let dir = format!("data/loglog_singleProfile_{}", timestamp);
+    std::fs::create_dir_all(&dir)?;
+    let prefix = format!("{}/loglog_singleProfile", dir);
 
     {
         let mut file = File::create(format!("{}_scan.csv", prefix))?;
@@ -497,6 +508,8 @@ fn run_loglog_analysis(params: &SimParams, results: &[SimResult]) -> Result<(), 
         }
     }
 
+    save_overview_to_path(results, &format!("{}_overview.png", prefix))?;
+
     let temps: Vec<f64> = results.iter().map(|r| r.temperature).collect();
     let mags: Vec<f64> = results.iter().map(|r| r.mean_m).collect();
 
@@ -506,6 +519,7 @@ fn run_loglog_analysis(params: &SimParams, results: &[SimResult]) -> Result<(), 
     let mut tc_results = Vec::new();
 
     let n_steps = ((params.tc_max - params.tc_min) / params.tc_step).round() as usize;
+    let total_steps = n_steps + 1;
     for i in 0..=n_steps {
         let tc = params.tc_min + i as f64 * params.tc_step;
         if tc < params.tc_min || tc > params.tc_max {
@@ -580,6 +594,7 @@ fn run_loglog_analysis(params: &SimParams, results: &[SimResult]) -> Result<(), 
             fit_points: x_vals.len(),
             is_valid,
         });
+        progress_cb(i + 1, total_steps);
     }
 
     {
@@ -691,6 +706,45 @@ fn run_loglog_analysis(params: &SimParams, results: &[SimResult]) -> Result<(), 
         }
     }
 
+    {
+        let mut file = File::create(format!("{}/summary.txt", dir))?;
+        writeln!(file, "Simulation summary")?;
+        writeln!(file, "Timestamp: {}", timestamp)?;
+        writeln!(file, "Output directory: {}", dir)?;
+        writeln!(file)?;
+        writeln!(file, "Model parameters")?;
+        writeln!(file, "L = {}", params.l)?;
+        writeln!(file, "J = {}", params.j)?;
+        writeln!(file, "p = {}", params.bond_p)?;
+        writeln!(file, "H = {}", params.h)?;
+        writeln!(file, "Initial state = {}", params.initial_state.label())?;
+        writeln!(file)?;
+        writeln!(file, "MC parameters")?;
+        writeln!(file, "MC steps   = {}", params.mc_steps)?;
+        writeln!(file, "Therm steps = {}", params.therm_steps)?;
+        writeln!(file, "Stride      = {}", params.stride)?;
+        writeln!(file)?;
+        writeln!(file, "Scan parameters")?;
+        writeln!(file, "T_start = {}", params.t_start)?;
+        writeln!(file, "T_end   = {}", params.t_end)?;
+        writeln!(file, "T_step  = {}", params.t_step)?;
+        writeln!(file, "Tc_step = {}", params.tc_step)?;
+        writeln!(file)?;
+        writeln!(file, "Auto analysis windows")?;
+        writeln!(file, "T window (envelope) = [{:.6}, {:.6}]", params.t_analysis_min, params.t_analysis_max)?;
+        writeln!(file, "Tc window (overlap)  = [{:.6}, {:.6}]", params.tc_min, params.tc_max)?;
+        writeln!(file)?;
+        writeln!(file, "Best Tc from log-log fit")?;
+        if let Some(b) = best {
+            writeln!(file, "Tc_best    = {:.8}", b.tc)?;
+            writeln!(file, "beta       = {:.8}", b.beta)?;
+            writeln!(file, "R_squared  = {:.8}", b.r_squared)?;
+            writeln!(file, "fit_points = {}", b.fit_points)?;
+        } else {
+            writeln!(file, "No valid Tc found (no positive-slope fits with R^2>0).")?;
+        }
+    }
+
     Ok(())
 }
 
@@ -736,10 +790,11 @@ fn draw_subplot(
     Ok(())
 }
 
-fn save_plots(results: &[SimResult]) -> Result<(), Box<dyn std::error::Error>> {
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-    let filename = format!("ising_results_{}.png", timestamp);
-    let root = BitMapBackend::new(&filename, (1200, 900)).into_drawing_area();
+fn save_overview_to_path(
+    results: &[SimResult],
+    filename: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = BitMapBackend::new(filename, (1200, 900)).into_drawing_area();
     root.fill(&WHITE)?;
 
     let areas = root.split_evenly((2, 2));
@@ -756,6 +811,31 @@ fn save_plots(results: &[SimResult]) -> Result<(), Box<dyn std::error::Error>> {
     draw_subplot(&areas[3], "Magnetic Susceptibility",      "chi",    &temps, &x_vals)?;
 
     root.present()?;
+    Ok(())
+}
+
+fn save_plots(results: &[SimResult]) -> Result<(), Box<dyn std::error::Error>> {
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let dir = format!("data/ising_results_{}", timestamp);
+    std::fs::create_dir_all(&dir)?;
+    let filename = format!("{}/ising_results.png", dir);
+    save_overview_to_path(results, &filename)?;
+
+    let csv_path = format!("{}/ising_results_scan.csv", dir);
+    {
+        use std::fs::File;
+        use std::io::Write;
+        let mut file = File::create(csv_path)?;
+        writeln!(file, "temperature,e_per_spin,m_abs_per_spin,c_per_spin,susceptibility")?;
+        for r in results {
+            writeln!(
+                file,
+                "{:.8},{:.8},{:.8},{:.8},{:.8}",
+                r.temperature, r.mean_e, r.mean_m, r.heat_cap, r.susceptibility
+            )?;
+        }
+    }
+
     Ok(())
 }
 
@@ -777,66 +857,91 @@ fn draw_setup(f: &mut ratatui::Frame<'_>, app: &App) {
     let header = Paragraph::new(
         "2D Ising Model — Parameter Setup\n\
          \u{2191}/\u{2193} navigate fields   type to edit   Backspace delete   \u{2190}/\u{2192} cycle Initial State\n\
-         Enter: run simulation    q: quit"
+         Enter: run simulation    c: copy params from previous run    q: quit"
     )
     .block(Block::default().borders(Borders::ALL).title("Controls"))
     .style(Style::default().fg(TuiColor::Cyan));
     f.render_widget(header, outer[0]);
 
-    // Parameters table
-    let field_names = [
-        "Lattice Size L",
-        "Interaction J",
-        "Bond disorder p",
-        "Initial State",
-        "T start",
-        "T end",
-        "T step",
-        "MC Steps",
-        "Therm Steps (default: MC/2)",
-        "Stride",
-        "External Field H",
-        "Log-log T_min",
-        "Log-log T_max",
-        "Tc_min",
-        "Tc_max",
-        "Tc_step",
+    let param_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(outer[1]);
+
+    let model_fields = [
+        (FIELD_L, "Lattice Size L"),
+        (FIELD_J, "Interaction J"),
+        (FIELD_P, "Bond disorder p"),
+        (FIELD_INIT, "Initial State"),
+        (FIELD_H, "External Field H"),
     ];
 
-    let rows: Vec<Row> = field_names
-        .iter()
-        .enumerate()
-        .map(|(i, &name)| {
-            let selected = i == app.selected_field;
-            let value = if i == FIELD_INIT {
-                if selected {
-                    format!("[{}]  <- / ->", app.initial_state.label())
+    let scan_fields = [
+        (FIELD_T_START, "T start"),
+        (FIELD_T_END, "T end"),
+        (FIELD_T_STEP, "T step"),
+        (FIELD_TC_STEP, "Tc_step"),
+    ];
+
+    let mc_fields = [
+        (FIELD_MC_STEPS, "MC Steps"),
+        (FIELD_THERM, "Therm Steps (default: MC/2)"),
+        (FIELD_STRIDE, "Stride"),
+    ];
+
+    let build_rows = |fields: &[(usize, &str)], app: &App| {
+        fields
+            .iter()
+            .map(|(idx, name)| {
+                let selected = *idx == app.selected_field;
+                let value = if *idx == FIELD_INIT {
+                    if selected {
+                        format!("[{}]  <- / ->", app.initial_state.label())
+                    } else {
+                        format!("[{}]", app.initial_state.label())
+                    }
+                } else if selected {
+                    format!("{}_", app.field_buffers[*idx])
                 } else {
-                    format!("[{}]", app.initial_state.label())
-                }
-            } else if selected {
-                format!("{}_", app.field_buffers[i])
-            } else {
-                app.field_buffers[i].clone()
-            };
+                    app.field_buffers[*idx].clone()
+                };
 
-            let style = if selected {
-                Style::default().fg(TuiColor::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(TuiColor::White)
-            };
+                let style = if selected {
+                    Style::default().fg(TuiColor::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TuiColor::White)
+                };
 
-            Row::new(vec![
-                Cell::from(name).style(style),
-                Cell::from(value).style(style),
-            ])
-        })
-        .collect();
+                Row::new(vec![
+                    Cell::from((*name).to_string()).style(style),
+                    Cell::from(value).style(style),
+                ])
+            })
+            .collect::<Vec<Row>>()
+    };
 
-    let table = Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(60)])
-        .block(Block::default().borders(Borders::ALL).title("Parameters"))
+    let model_rows = build_rows(&model_fields, app);
+    let scan_rows = build_rows(&scan_fields, app);
+    let mc_rows = build_rows(&mc_fields, app);
+
+    let model_table = Table::new(model_rows, [Constraint::Percentage(40), Constraint::Percentage(60)])
+        .block(Block::default().borders(Borders::ALL).title("Model Parameters"))
         .column_spacing(2);
-    f.render_widget(table, outer[1]);
+    f.render_widget(model_table, param_areas[0]);
+
+    let scan_table = Table::new(scan_rows, [Constraint::Percentage(40), Constraint::Percentage(60)])
+        .block(Block::default().borders(Borders::ALL).title("Current Scan Parameters"))
+        .column_spacing(2);
+    f.render_widget(scan_table, param_areas[1]);
+
+    let mc_table = Table::new(mc_rows, [Constraint::Percentage(40), Constraint::Percentage(60)])
+        .block(Block::default().borders(Borders::ALL).title("MC Parameters"))
+        .column_spacing(2);
+    f.render_widget(mc_table, param_areas[2]);
 
     // Footer: error or hint
     let footer_text = app
@@ -854,7 +959,7 @@ fn draw_setup(f: &mut ratatui::Frame<'_>, app: &App) {
     f.render_widget(footer, outer[2]);
 }
 
-fn draw_running(
+fn draw_running_sweep(
     f: &mut ratatui::Frame<'_>,
     current_t: f64,
     t_end: f64,
@@ -887,16 +992,261 @@ fn draw_running(
     f.render_widget(gauge, layout[1]);
 }
 
-fn draw_done(f: &mut ratatui::Frame<'_>, results: &[SimResult]) {
-    let t0 = results.first().map(|r| r.temperature).unwrap_or(0.0);
-    let t1 = results.last().map(|r| r.temperature).unwrap_or(0.0);
+fn draw_step1_summary(f: &mut ratatui::Frame<'_>, app: &App) {
+    let area = f.area();
+    let text = if let (Some(intervals), Some(params)) = (&app.auto_intervals, &app.sim_params) {
+        let p = &intervals.primary;
+        let s = intervals.secondary.as_ref();
+        let c_peak = intervals
+            .c_peak_t
+            .map(|t| format!("{:.6}", t))
+            .unwrap_or_else(|| "N/A".to_string());
+        let chi_peak = intervals
+            .chi_peak_t
+            .map(|t| format!("{:.6}", t))
+            .unwrap_or_else(|| "N/A".to_string());
+        let m_peak = intervals
+            .m_slope_peak_t
+            .map(|t| format!("{:.6}", t))
+            .unwrap_or_else(|| "N/A".to_string());
+        if let Some(sec) = s {
+            format!(
+                "Step 1 complete.\n\n\
+                 Model parameters:\n\
+                 L = {l}, J = {j}, p = {pval}, H = {h}, Init = {init}\n\
+                 T scan: start = {ts:.6}, end = {te:.6}, step = {dt:.6}\n\
+                 Tc step = {dtc:.6}\n\n\
+                 Critical points (from Step 1):\n\
+                 C(T) peak at T = {c_peak}\n\
+                 χ(T) peak at T = {chi_peak}\n\
+                 |dm/dT| max at T = {m_peak}\n\n\
+                 Candidate 1 (primary):\n\
+                 T window:  [{p_ta_min:.6}, {p_ta_max:.6}]\n\
+                 Tc window: [{p_tc_min:.6}, {p_tc_max:.6}]\n\n\
+                 Candidate 2 (secondary):\n\
+                 T window:  [{s_ta_min:.6}, {s_ta_max:.6}]\n\
+                 Tc window: [{s_tc_min:.6}, {s_tc_max:.6}]\n\n\
+                 Press '1' to use Candidate 1.\n\
+                 Press '2' to use Candidate 2.\n\
+                 Press '3' for manual edit (Candidate 3).\n\
+                 Press 'q' to quit.",
+                l = params.l,
+                j = params.j,
+                pval = params.bond_p,
+                h = params.h,
+                init = params.initial_state.label(),
+                ts = params.t_start,
+                te = params.t_end,
+                dt = params.t_step,
+                dtc = params.tc_step,
+                c_peak = c_peak,
+                chi_peak = chi_peak,
+                m_peak = m_peak,
+                p_ta_min = p.t_envelope_min,
+                p_ta_max = p.t_envelope_max,
+                p_tc_min = p.tc_overlap_min,
+                p_tc_max = p.tc_overlap_max,
+                s_ta_min = sec.t_envelope_min,
+                s_ta_max = sec.t_envelope_max,
+                s_tc_min = sec.tc_overlap_min,
+                s_tc_max = sec.tc_overlap_max,
+            )
+        } else {
+            format!(
+                "Step 1 complete.\n\n\
+                 Model parameters:\n\
+                 L = {l}, J = {j}, p = {pval}, H = {h}, Init = {init}\n\
+                 T scan: start = {ts:.6}, end = {te:.6}, step = {dt:.6}\n\
+                 Tc step = {dtc:.6}\n\n\
+                 Critical points (from Step 1):\n\
+                 C(T) peak at T = {c_peak}\n\
+                 χ(T) peak at T = {chi_peak}\n\
+                 |dm/dT| max at T = {m_peak}\n\n\
+                 Candidate (primary):\n\
+                 T window:  [{p_ta_min:.6}, {p_ta_max:.6}]\n\
+                 Tc window: [{p_tc_min:.6}, {p_tc_max:.6}]\n\n\
+                 Press '1' to use this candidate.\n\
+                 Press '3' for manual edit (Candidate 3).\n\
+                 Press 'q' to quit.",
+                l = params.l,
+                j = params.j,
+                pval = params.bond_p,
+                h = params.h,
+                init = params.initial_state.label(),
+                ts = params.t_start,
+                te = params.t_end,
+                dt = params.t_step,
+                dtc = params.tc_step,
+                c_peak = c_peak,
+                chi_peak = chi_peak,
+                m_peak = m_peak,
+                p_ta_min = p.t_envelope_min,
+                p_ta_max = p.t_envelope_max,
+                p_tc_min = p.tc_overlap_min,
+                p_tc_max = p.tc_overlap_max,
+            )
+        }
+    } else {
+        "Step 1 complete, but auto analysis intervals or parameters are not available.\n\nPress 'q' to quit."
+            .to_string()
+    };
+    let para = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title("Auto Analysis Summary"))
+        .style(Style::default().fg(TuiColor::Green));
+    f.render_widget(para, area);
+}
+
+fn draw_load_params(f: &mut ratatui::Frame<'_>, app: &App) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5), Constraint::Length(3)])
+        .split(f.area());
+
+    let header = Paragraph::new(
+        "Copy parameters from previous run\n\
+         \u{2191}/\u{2193} select run   Enter: load   Esc: back   q: quit",
+    )
+    .block(Block::default().borders(Borders::ALL).title("Copy Parameters"))
+    .style(Style::default().fg(TuiColor::Cyan));
+    f.render_widget(header, layout[0]);
+
+    let mut rows = Vec::new();
+    if app.saved_runs.is_empty() {
+        rows.push(Row::new(vec![Cell::from("No previous runs with summary.txt found under data/")]));
+    } else {
+        for (idx, (name, _path)) in app.saved_runs.iter().enumerate() {
+            let selected = idx == app.saved_run_selected;
+            let style = if selected {
+                Style::default().fg(TuiColor::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TuiColor::White)
+            };
+            rows.push(Row::new(vec![Cell::from(name.clone()).style(style)]));
+        }
+    }
+
+    let table = Table::new(rows, [Constraint::Percentage(100)])
+        .block(Block::default().borders(Borders::ALL).title("Available runs"))
+        .column_spacing(1);
+    f.render_widget(table, layout[1]);
+
+    let footer_text = app
+        .error_msg
+        .as_deref()
+        .unwrap_or("Select a run and press Enter to load its parameters.");
+    let footer_style = if app.error_msg.is_some() {
+        Style::default().fg(TuiColor::Red)
+    } else {
+        Style::default().fg(TuiColor::Gray)
+    };
+    let footer = Paragraph::new(footer_text)
+        .block(Block::default().borders(Borders::ALL).title("Messages"))
+        .style(footer_style);
+    f.render_widget(footer, layout[2]);
+}
+
+fn draw_running_tc_scan(
+    f: &mut ratatui::Frame<'_>,
+    done: usize,
+    total: usize,
+) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(3)])
+        .split(f.area());
+
+    let pct = if total > 0 { (done * 100) / total } else { 0 };
+    let text = format!(
+        "Running Tc log-log analysis — please wait...\n\n\
+         Progress            : {}/{} Tc candidates  ({}%)",
+        done, total, pct
+    );
+    let para = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title("Tc Scan Running"))
+        .style(Style::default().fg(TuiColor::Green));
+    f.render_widget(para, layout[0]);
+
+    let ratio = if total > 0 { (done as f64 / total as f64).clamp(0.0, 1.0) } else { 0.0 };
+    let gauge = Gauge::default()
+        .block(Block::default().borders(Borders::ALL).title("Progress"))
+        .gauge_style(Style::default().fg(TuiColor::Green).bg(TuiColor::Black))
+        .ratio(ratio);
+    f.render_widget(gauge, layout[1]);
+}
+
+fn draw_manual_window_edit(f: &mut ratatui::Frame<'_>, app: &App) {
+    let area = f.area();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(3)])
+        .split(area);
+
+    let state = if let Some(s) = &app.manual_window_state {
+        s
+    } else {
+        return;
+    };
+
+    let labels = [
+        "T_analysis_min",
+        "T_analysis_max",
+        "Tc_min",
+        "Tc_max",
+    ];
+
+    let rows = labels
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let val = &state.fields[i];
+            let style = if i == state.selected {
+                Style::default().fg(TuiColor::Yellow)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![Cell::from(*name), Cell::from(val.clone())]).style(style)
+        });
+
+    let table = Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(60)])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Manual Tc Window (Candidate 3)"),
+        )
+        .column_spacing(2);
+    f.render_widget(table, layout[0]);
+
+    let footer_text = app
+        .error_msg
+        .as_deref()
+        .unwrap_or("Use Up/Down to select, type to edit, Enter to run, Esc to go back, 'q' to quit.");
+    let footer_style = if app.error_msg.is_some() {
+        Style::default().fg(TuiColor::Red)
+    } else {
+        Style::default().fg(TuiColor::Gray)
+    };
+    let footer = Paragraph::new(footer_text)
+        .block(Block::default().borders(Borders::ALL).title("Manual Edit Help"))
+        .style(footer_style);
+    f.render_widget(footer, layout[1]);
+}
+
+fn draw_done(f: &mut ratatui::Frame<'_>, app: &App) {
+    let results_slice: &[SimResult] = app
+        .results
+        .as_deref()
+        .unwrap_or(&[]);
+    let t0 = results_slice.first().map(|r| r.temperature).unwrap_or(0.0);
+    let t1 = results_slice.last().map(|r| r.temperature).unwrap_or(0.0);
     let text = format!(
         "Simulation complete!\n\n\
          Temperatures computed : {}\n\
          T range               : {:.3} — {:.3}\n\n\
          Results saved to: ising_results_<timestamp>.png\n\n\
          Press 'q' to quit.",
-        results.len(), t0, t1
+        results_slice.len(),
+        t0,
+        t1
     );
     let para = Paragraph::new(text)
         .block(Block::default().borders(Borders::ALL).title("Done"))
@@ -907,10 +1257,16 @@ fn draw_done(f: &mut ratatui::Frame<'_>, results: &[SimResult]) {
 fn draw_frame(f: &mut ratatui::Frame<'_>, app: &App) {
     match &app.mode {
         AppMode::Setup => draw_setup(f, app),
-        AppMode::Running { current_t, t_end, done, total } => {
-            draw_running(f, *current_t, *t_end, *done, *total)
+        AppMode::LoadParams => draw_load_params(f, app),
+        AppMode::RunningSweep { current_t, t_end, done, total } => {
+            draw_running_sweep(f, *current_t, *t_end, *done, *total)
         }
-        AppMode::Done(results) => draw_done(f, results),
+        AppMode::Step1Summary => draw_step1_summary(f, app),
+        AppMode::ManualWindowEdit => draw_manual_window_edit(f, app),
+        AppMode::RunningTcScan { done, total } => {
+            draw_running_tc_scan(f, *done, *total)
+        }
+        AppMode::Done => draw_done(f, app),
     }
 }
 
@@ -925,15 +1281,302 @@ fn handle_key(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<(), String> {
     match &app.mode {
-        AppMode::Done(_) => {
+        AppMode::Done => {
             if key == KeyCode::Char('q') {
                 return Err("quit".into());
             }
         }
-        AppMode::Running { .. } => {} // should not be reached
+        AppMode::LoadParams => {
+            match key {
+                KeyCode::Char('q') => return Err("quit".into()),
+                KeyCode::Esc => {
+                    app.mode = AppMode::Setup;
+                    app.error_msg = None;
+                }
+                KeyCode::Up => {
+                    if app.saved_run_selected > 0 {
+                        app.saved_run_selected -= 1;
+                    }
+                    app.error_msg = None;
+                }
+                KeyCode::Down => {
+                    if !app.saved_runs.is_empty() {
+                        if app.saved_run_selected + 1 < app.saved_runs.len() {
+                            app.saved_run_selected += 1;
+                        }
+                    }
+                    app.error_msg = None;
+                }
+                KeyCode::Enter => {
+                    if app.saved_runs.is_empty() {
+                        app.error_msg =
+                            Some("No previous runs with summary.txt found under data/".into());
+                        return Ok(());
+                    }
+                    let (_name, path) = app.saved_runs[app.saved_run_selected].clone();
+                    match load_params::load_params_from_summary_dir(&path) {
+                        Ok(params) => {
+                            app.sim_params = Some(params.clone());
+                            app.initial_state = params.initial_state;
+                            app.field_buffers[FIELD_L] = params.l.to_string();
+                            app.field_buffers[FIELD_J] = format!("{}", params.j);
+                            app.field_buffers[FIELD_P] = format!("{}", params.bond_p);
+                            app.field_buffers[FIELD_T_START] = format!("{}", params.t_start);
+                            app.field_buffers[FIELD_T_END] = format!("{}", params.t_end);
+                            app.field_buffers[FIELD_T_STEP] = format!("{}", params.t_step);
+                            app.field_buffers[FIELD_MC_STEPS] = params.mc_steps.to_string();
+                            app.field_buffers[FIELD_THERM] = params.therm_steps.to_string();
+                            app.field_buffers[FIELD_STRIDE] = params.stride.to_string();
+                            app.field_buffers[FIELD_H] = format!("{}", params.h);
+                            app.field_buffers[FIELD_TC_STEP] = format!("{}", params.tc_step);
+                            app.selected_field = 0;
+                            app.error_msg = None;
+                            app.mode = AppMode::Setup;
+                        }
+                        Err(e) => {
+                            app.error_msg = Some(e);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        AppMode::RunningSweep { .. } | AppMode::RunningTcScan { .. } => {}
+        AppMode::Step1Summary => {
+            match key {
+                KeyCode::Char('q') => return Err("quit".into()),
+                KeyCode::Char('1') | KeyCode::Char('2') => {
+                    let use_secondary = matches!(key, KeyCode::Char('2'));
+                    let params = match app.sim_params.clone() {
+                        Some(p) => p,
+                        None => {
+                            app.error_msg = Some("No simulation parameters available for Tc scan".into());
+                            return Ok(());
+                        }
+                    };
+                    let intervals = match app.auto_intervals.clone() {
+                        Some(v) => v,
+                        None => {
+                            app.error_msg = Some("No auto analysis intervals available for Tc scan".into());
+                            return Ok(());
+                        }
+                    };
+                    let window = if use_secondary {
+                        match intervals.secondary {
+                            Some(w) => w,
+                            None => intervals.primary,
+                        }
+                    } else {
+                        intervals.primary
+                    };
+                    let results_slice: Vec<SimResult> = match app.results.clone() {
+                        Some(v) => v,
+                        None => {
+                            app.error_msg = Some("No simulation results available for Tc scan".into());
+                            return Ok(());
+                        }
+                    };
+                    let mut params_for_tc = params;
+                    params_for_tc.t_analysis_min = window.t_envelope_min;
+                    params_for_tc.t_analysis_max = window.t_envelope_max;
+                    params_for_tc.tc_min = window.tc_overlap_min;
+                    params_for_tc.tc_max = window.tc_overlap_max;
+
+                    let total_steps = {
+                        let n_steps = ((params_for_tc.tc_max - params_for_tc.tc_min)
+                            / params_for_tc.tc_step)
+                            .round() as usize;
+                        n_steps + 1
+                    };
+
+                    app.mode = AppMode::RunningTcScan { done: 0, total: total_steps };
+                    let _ = terminal.draw(|f| draw_frame(f, app));
+
+                    match run_loglog_analysis(&params_for_tc, &results_slice, |done, total| {
+                        app.mode = AppMode::RunningTcScan { done, total };
+                        let _ = terminal.draw(|f| draw_frame(f, app));
+                    }) {
+                        Ok(()) => {
+                            app.mode = AppMode::Done;
+                            app.results = Some(results_slice);
+                        }
+                        Err(e) => {
+                            app.mode = AppMode::Setup;
+                            app.error_msg = Some(format!("Log-log analysis error: {}", e));
+                        }
+                    }
+                }
+                KeyCode::Char('3') => {
+                    let intervals = match app.auto_intervals.clone() {
+                        Some(v) => v,
+                        None => {
+                            app.error_msg = Some("No auto analysis intervals available for manual edit".into());
+                            return Ok(());
+                        }
+                    };
+                    let base = intervals.primary;
+                    let fields = [
+                        format!("{:.6}", base.t_envelope_min),
+                        format!("{:.6}", base.t_envelope_max),
+                        format!("{:.6}", base.tc_overlap_min),
+                        format!("{:.6}", base.tc_overlap_max),
+                    ];
+                    app.manual_window_state = Some(ManualWindowEditState {
+                        fields,
+                        selected: 0,
+                    });
+                    app.error_msg = None;
+                    app.mode = AppMode::ManualWindowEdit;
+                }
+                _ => {}
+            }
+        }
+        AppMode::ManualWindowEdit => {
+            match key {
+                KeyCode::Char('q') => return Err("quit".into()),
+                KeyCode::Esc => {
+                    app.manual_window_state = None;
+                    app.error_msg = None;
+                    app.mode = AppMode::Step1Summary;
+                }
+                KeyCode::Up => {
+                    if let Some(state) = &mut app.manual_window_state {
+                        if state.selected > 0 {
+                            state.selected -= 1;
+                        }
+                    }
+                    app.error_msg = None;
+                }
+                KeyCode::Down => {
+                    if let Some(state) = &mut app.manual_window_state {
+                        if state.selected < 3 {
+                            state.selected += 1;
+                        }
+                    }
+                    app.error_msg = None;
+                }
+                KeyCode::Backspace => {
+                    if let Some(state) = &mut app.manual_window_state {
+                        let idx = state.selected;
+                        state.fields[idx].pop();
+                    }
+                    app.error_msg = None;
+                }
+                KeyCode::Char(c) => {
+                    if let Some(state) = &mut app.manual_window_state {
+                        let idx = state.selected;
+                        state.fields[idx].push(c);
+                    }
+                    app.error_msg = None;
+                }
+                KeyCode::Enter => {
+                    let state = match &app.manual_window_state {
+                        Some(s) => s.clone(),
+                        None => {
+                            app.error_msg = Some("No manual window state".into());
+                            return Ok(());
+                        }
+                    };
+                    let parse_f = |s: &str| -> Result<f64, String> {
+                        s.trim()
+                            .parse::<f64>()
+                            .map_err(|_| format!("Invalid number '{}'", s))
+                    };
+                    let t_min = parse_f(&state.fields[0])?;
+                    let t_max = parse_f(&state.fields[1])?;
+                    let tc_min = parse_f(&state.fields[2])?;
+                    let tc_max = parse_f(&state.fields[3])?;
+                    if t_min >= t_max {
+                        app.error_msg = Some("T_analysis_min must be < T_analysis_max".into());
+                        return Ok(());
+                    }
+                    if tc_min >= tc_max {
+                        app.error_msg = Some("Tc_min must be < Tc_max".into());
+                        return Ok(());
+                    }
+
+                    let params = match app.sim_params.clone() {
+                        Some(p) => p,
+                        None => {
+                            app.error_msg =
+                                Some("No simulation parameters available for Tc scan".into());
+                            return Ok(());
+                        }
+                    };
+                    let results_slice: Vec<SimResult> = match app.results.clone() {
+                        Some(v) => v,
+                        None => {
+                            app.error_msg =
+                                Some("No simulation results available for Tc scan".into());
+                            return Ok(());
+                        }
+                    };
+
+                    let mut params_for_tc = params;
+                    params_for_tc.t_analysis_min = t_min;
+                    params_for_tc.t_analysis_max = t_max;
+                    params_for_tc.tc_min = tc_min;
+                    params_for_tc.tc_max = tc_max;
+
+                    let total_steps = {
+                        let n_steps = ((params_for_tc.tc_max - params_for_tc.tc_min)
+                            / params_for_tc.tc_step)
+                            .round() as usize;
+                        n_steps + 1
+                    };
+
+                    app.mode = AppMode::RunningTcScan { done: 0, total: total_steps };
+                    let _ = terminal.draw(|f| draw_frame(f, app));
+
+                    match run_loglog_analysis(&params_for_tc, &results_slice, |done, total| {
+                        app.mode = AppMode::RunningTcScan { done, total };
+                        let _ = terminal.draw(|f| draw_frame(f, app));
+                    }) {
+                        Ok(()) => {
+                            app.mode = AppMode::Done;
+                            app.results = Some(results_slice);
+                        }
+                        Err(e) => {
+                            app.mode = AppMode::Setup;
+                            app.error_msg =
+                                Some(format!("Log-log analysis error: {}", e));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         AppMode::Setup => {
             match key {
                 KeyCode::Char('q') => return Err("quit".into()),
+
+                KeyCode::Char('c') => {
+                    let mut entries = Vec::new();
+                    if let Ok(dir) = std::fs::read_dir("data") {
+                        for e in dir.flatten() {
+                            if let Ok(ft) = e.file_type() {
+                                if ft.is_dir() {
+                                    let path = e.path();
+                                    let summary = path.join("summary.txt");
+                                    if summary.is_file() {
+                                        let name = path
+                                            .file_name()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let path_str = path.to_string_lossy().to_string();
+                                        entries.push((name, path_str));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                    app.saved_run_selected = 0;
+                    app.saved_runs = entries;
+                    app.mode = AppMode::LoadParams;
+                    app.error_msg = None;
+                }
 
                 KeyCode::Up => {
                     app.selected_field = app.selected_field.saturating_sub(1);
@@ -967,11 +1610,10 @@ fn handle_key(
                         }
                         Ok(params) => {
                             app.error_msg = None;
-                            // Run the sweep, redrawing the progress TUI at each temperature
+                            app.sim_params = Some(params.clone());
                             let t_end = params.t_end;
                             let results = run_sweep(&params, |cur_t, done, total| {
-                                // Temporarily update mode to show progress
-                                app.mode = AppMode::Running {
+                                app.mode = AppMode::RunningSweep {
                                     current_t: cur_t,
                                     t_end,
                                     done,
@@ -979,13 +1621,33 @@ fn handle_key(
                                 };
                                 let _ = terminal.draw(|f| draw_frame(f, app));
                             });
-                            // Generate plots and log-log analysis outputs
                             match save_plots(&results) {
                                 Ok(()) => {
-                                    if let Err(e) = run_loglog_analysis(&params, &results) {
-                                        app.error_msg = Some(format!("Log-log analysis error: {}", e));
+                                    let temps: Vec<f64> =
+                                        results.iter().map(|r| r.temperature).collect();
+                                    let c_vals: Vec<f64> =
+                                        results.iter().map(|r| r.heat_cap).collect();
+                                    let x_vals: Vec<f64> =
+                                        results.iter().map(|r| r.susceptibility).collect();
+                                    let m_vals: Vec<f64> =
+                                        results.iter().map(|r| r.mean_m).collect();
+                                    match autoanalysis::compute_intervals(
+                                        &temps,
+                                        &c_vals,
+                                        &x_vals,
+                                        &m_vals,
+                                    ) {
+                                        Ok(intervals) => {
+                                            app.auto_intervals = Some(intervals);
+                                            app.results = Some(results);
+                                            app.mode = AppMode::Step1Summary;
+                                        }
+                                        Err(e) => {
+                                            app.mode = AppMode::Setup;
+                                            app.error_msg =
+                                                Some(format!("Auto analysis error: {}", e));
+                                        }
                                     }
-                                    app.mode = AppMode::Done(results);
                                 }
                                 Err(e) => {
                                     app.mode = AppMode::Setup;
