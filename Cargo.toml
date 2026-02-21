@@ -2,6 +2,7 @@
 name = "ising-monte-carlo"
 version = "0.1.0"
 edition = "2021"
+default-run = "ising-monte-carlo"
 
 [dependencies]
 crossterm = "0.28"
@@ -9,3 +10,11 @@ ratatui = "0.28"
 rand = "0.8"
 plotters = { version = "0.3", features = ["bitmap_backend"] }
 chrono = { version = "0.4", features = ["clock"] }
+
+[[bin]]
+name = "auto-aggregation"
+path = "src/auto_aggregation.rs"
+
+[[bin]]
+name = "batch-input"
+path = "src/batch_input.rs"

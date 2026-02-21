@@ -16,7 +16,7 @@ use ratatui::{
     Terminal,
 };
 use chrono::Local;
-use std::io;
+use std::io::{self, Write};
 
 // ─────────────────────────────────────────────
 // Ising model core
@@ -210,6 +210,7 @@ struct SimParams {
     therm_steps: usize,
     stride: usize,
     h: f64,
+    use_outlier_filter: bool,
 }
 
 impl Default for SimParams {
@@ -233,6 +234,7 @@ impl Default for SimParams {
             therm_steps: mc_steps / 2,
             stride: 10,
             h: 0.0,
+            use_outlier_filter: false,
         }
     }
 }
@@ -244,6 +246,7 @@ struct SimResult {
     mean_m:        f64, // <|M|>/N
     heat_cap:      f64, // Var(E)/(T²·N)
     susceptibility: f64, // Var(M)/(T·N)
+    is_outlier:    bool,
 }
 
 // ─────────────────────────────────────────────
@@ -302,6 +305,7 @@ struct App {
     field_buffers:        Vec<String>,
     selected_field:       usize,
     initial_state:        InitialState,
+    outlier_filter:       bool,
     error_msg:            Option<String>,
     results:              Option<Vec<SimResult>>,
     auto_intervals:       Option<autoanalysis::AutoAnalysisIntervals>,
@@ -332,6 +336,7 @@ impl App {
             field_buffers: b,
             selected_field: 0,
             initial_state: d.initial_state,
+            outlier_filter: d.use_outlier_filter,
             error_msg: None,
             results: None,
             auto_intervals: None,
@@ -409,6 +414,7 @@ impl App {
             therm_steps,
             stride,
             h,
+            use_outlier_filter: self.outlier_filter,
         })
     }
 }
@@ -486,7 +492,7 @@ fn measure_at_temperature(p: &SimParams, temperature: f64, rng: &mut impl Rng) -
     let heat_cap = heat_cap_acc * inv_samples;
     let chi = chi_acc * inv_samples;
 
-    SimResult { temperature, mean_e, mean_m, heat_cap, susceptibility: chi }
+    SimResult { temperature, mean_e, mean_m, heat_cap, susceptibility: chi, is_outlier: false }
 }
 
 fn run_sweep(
@@ -521,6 +527,7 @@ struct TcScanResult {
 fn run_loglog_analysis(
     params: &SimParams,
     results: &[SimResult],
+    output_root: &str,
     mut progress_cb: impl FnMut(usize, usize),
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::fs::File;
@@ -531,7 +538,7 @@ fn run_loglog_analysis(
     }
 
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-    let dir = format!("data/loglog_singleProfile_{}", timestamp);
+    let dir = format!("{}/loglog_singleProfile_{}", output_root, timestamp);
     std::fs::create_dir_all(&dir)?;
     let prefix = format!("{}/loglog_singleProfile", dir);
 
@@ -547,13 +554,38 @@ fn run_loglog_analysis(
         }
     }
 
-    save_overview_to_path(results, &format!("{}_overview.png", prefix))?;
-
-    let temps: Vec<f64> = results.iter().map(|r| r.temperature).collect();
-    let mags: Vec<f64> = results.iter().map(|r| r.mean_m).collect();
-
     let t_min = params.t_analysis_min;
     let t_max = params.t_analysis_max;
+
+    let mut marked: Vec<SimResult> = results.to_vec();
+    if params.use_outlier_filter {
+        let mut max_c = f64::NEG_INFINITY;
+        let mut max_chi = f64::NEG_INFINITY;
+        for r in &marked {
+            if r.temperature >= t_min && r.temperature <= t_max {
+                if r.heat_cap > max_c {
+                    max_c = r.heat_cap;
+                }
+                if r.susceptibility > max_chi {
+                    max_chi = r.susceptibility;
+                }
+            }
+        }
+        if max_c.is_finite() && max_chi.is_finite() {
+            for r in &mut marked {
+                if (r.temperature < t_min || r.temperature > t_max)
+                    && (r.heat_cap > max_c || r.susceptibility > max_chi)
+                {
+                    r.is_outlier = true;
+                }
+            }
+        }
+    }
+
+    save_overview_to_path(&marked, &format!("{}_overview.png", prefix))?;
+
+    let temps: Vec<f64> = marked.iter().map(|r| r.temperature).collect();
+    let mags: Vec<f64> = marked.iter().map(|r| r.mean_m).collect();
 
     let mut tc_results = Vec::new();
 
@@ -568,7 +600,10 @@ fn run_loglog_analysis(
         let mut x_vals = Vec::new();
         let mut y_vals = Vec::new();
 
-        for (&t, &m) in temps.iter().zip(mags.iter()) {
+        for (idx, (&t, &m)) in temps.iter().zip(mags.iter()).enumerate() {
+            if marked[idx].is_outlier {
+                continue;
+            }
             if t < tc && t >= t_min && t <= t_max && m > 0.0 {
                 let x = (tc - t).ln();
                 let y = m.ln();
@@ -695,7 +730,10 @@ fn run_loglog_analysis(
     if let Some(b) = best {
         let mut x_vals = Vec::new();
         let mut y_vals = Vec::new();
-        for (&t, &m) in temps.iter().zip(mags.iter()) {
+        for (idx, (&t, &m)) in temps.iter().zip(mags.iter()).enumerate() {
+            if marked[idx].is_outlier {
+                continue;
+            }
             if t < b.tc && t >= t_min && t <= t_max && m > 0.0 {
                 let x = (b.tc - t).ln();
                 let y = m.ln();
@@ -790,6 +828,112 @@ fn run_loglog_analysis(
     }
 
     Ok(())
+}
+
+fn run_headless_single(params: &SimParams) -> Result<(), Box<dyn std::error::Error>> {
+    let mut last_sweep_done: usize = 0;
+    let results = run_sweep(params, |cur_t, done, total| {
+        if total > 0 && done != last_sweep_done {
+            last_sweep_done = done;
+            println!("BATCH_PROGRESS SWEEP {} {} {:.8}", done, total, cur_t);
+            let _ = io::stdout().flush();
+        }
+    });
+
+    let mut params_for_tc = params.clone();
+    let window_mode =
+        std::env::var("BATCH_WINDOW_MODE").unwrap_or_else(|_| "fixed".to_string());
+    if window_mode == "auto" {
+        let temps: Vec<f64> = results.iter().map(|r| r.temperature).collect();
+        let mags: Vec<f64> = results.iter().map(|r| r.mean_m).collect();
+        let c_vals: Vec<f64> = results.iter().map(|r| r.heat_cap).collect();
+        let chi_vals: Vec<f64> = results.iter().map(|r| r.susceptibility).collect();
+        let intervals = autoanalysis::compute_intervals(&temps, &c_vals, &chi_vals, &mags)?;
+        let primary = intervals.primary;
+        params_for_tc.t_analysis_min = primary.t_envelope_min;
+        params_for_tc.t_analysis_max = primary.t_envelope_max;
+        params_for_tc.tc_min = primary.tc_overlap_min;
+        params_for_tc.tc_max = primary.tc_overlap_max;
+    } else {
+        let t_min = std::env::var("BATCH_T_MIN")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(2.0);
+        let t_max = std::env::var("BATCH_T_MAX")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(2.45);
+        let tc_min = std::env::var("BATCH_TC_MIN")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(2.25);
+        let tc_max = std::env::var("BATCH_TC_MAX")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(2.45);
+        params_for_tc.t_analysis_min = t_min;
+        params_for_tc.t_analysis_max = t_max;
+        params_for_tc.tc_min = tc_min;
+        params_for_tc.tc_max = tc_max;
+    }
+
+    let output_root =
+        std::env::var("BATCH_OUTPUT_ROOT").unwrap_or_else(|_| "data_batch".to_string());
+
+    let mut last_tc_done: usize = 0;
+    run_loglog_analysis(&params_for_tc, &results, &output_root, |done, total| {
+        if total > 0 && done != last_tc_done {
+            last_tc_done = done;
+            println!("BATCH_PROGRESS TC {} {}", done, total);
+            let _ = io::stdout().flush();
+        }
+    })
+}
+
+fn run_batch_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    let l = std::env::var("BATCH_L")?.parse::<usize>()?;
+    let j = std::env::var("BATCH_J")?.parse::<f64>()?;
+    let p = std::env::var("BATCH_P")?.parse::<f64>()?;
+    let t_start = std::env::var("BATCH_T_START")?.parse::<f64>()?;
+    let t_end = std::env::var("BATCH_T_END")?.parse::<f64>()?;
+    let t_step = std::env::var("BATCH_T_STEP")?.parse::<f64>()?;
+    let mc_steps = std::env::var("BATCH_MC_STEPS")?.parse::<usize>()?;
+    let therm_steps = std::env::var("BATCH_THERM_STEPS")?.parse::<usize>()?;
+    let stride = std::env::var("BATCH_STRIDE")?.parse::<usize>()?;
+    let h = std::env::var("BATCH_H")?.parse::<f64>()?;
+    let sample_count = std::env::var("BATCH_SAMPLE_COUNT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1);
+    let init = std::env::var("BATCH_INIT").unwrap_or_else(|_| "Random".into());
+    let initial_state = match init.as_str() {
+        "AllUp" => InitialState::AllUp,
+        "AllDown" => InitialState::AllDown,
+        _ => InitialState::Random,
+    };
+
+    let params = SimParams {
+        l,
+        j,
+        bond_p: p,
+        sample_count,
+        initial_state,
+        t_start,
+        t_end,
+        t_step,
+        t_analysis_min: t_start,
+        t_analysis_max: t_end,
+        tc_min: t_start,
+        tc_max: t_end,
+        tc_step: 0.0001,
+        mc_steps,
+        therm_steps,
+        stride,
+        h,
+        use_outlier_filter: std::env::var("BATCH_OUTLIER_FILTER").ok().as_deref() == Some("1"),
+    };
+
+    run_headless_single(&params)
 }
 
 // ─────────────────────────────────────────────
@@ -1075,7 +1219,15 @@ fn draw_setup(f: &mut ratatui::Frame<'_>, app: &App) {
         Cell::from(bonds_text).style(bonds_row_style),
     ]));
     let scan_rows = build_rows(&scan_fields, app);
-    let mc_rows = build_rows(&mc_fields, app);
+    let mut mc_rows = build_rows(&mc_fields, app);
+    let filter_style = Style::default()
+        .fg(TuiColor::Magenta)
+        .add_modifier(Modifier::BOLD);
+    let filter_text = if app.outlier_filter { "open" } else { "off" };
+    mc_rows.push(Row::new(vec![
+        Cell::from("Outlier filter").style(filter_style),
+        Cell::from(format!("{} (press 'o' to toggle)", filter_text)).style(filter_style),
+    ]));
 
     let model_table = Table::new(model_rows, [Constraint::Percentage(40), Constraint::Percentage(60)])
         .block(Block::default().borders(Borders::ALL).title("Model Parameters"))
@@ -1157,13 +1309,15 @@ fn draw_step1_summary(f: &mut ratatui::Frame<'_>, app: &App) {
             .m_slope_peak_t
             .map(|t| format!("{:.6}", t))
             .unwrap_or_else(|| "N/A".to_string());
+        let filter_label = if params.use_outlier_filter { "open" } else { "off" };
         if let Some(sec) = s {
             format!(
                 "Step 1 complete.\n\n\
                  Model parameters:\n\
                  L = {l}, J = {j}, p = {pval}, H = {h}, Init = {init}\n\
                  T scan: start = {ts:.6}, end = {te:.6}, step = {dt:.6}\n\
-                 Tc step = {dtc:.6}\n\n\
+                 Tc step = {dtc:.6}\n\
+                 Outlier filter: {filter}\n\n\
                  Critical points (from Step 1):\n\
                  C(T) peak at T = {c_peak}\n\
                  χ(T) peak at T = {chi_peak}\n\
@@ -1187,6 +1341,7 @@ fn draw_step1_summary(f: &mut ratatui::Frame<'_>, app: &App) {
                 te = params.t_end,
                 dt = params.t_step,
                 dtc = params.tc_step,
+                filter = filter_label,
                 c_peak = c_peak,
                 chi_peak = chi_peak,
                 m_peak = m_peak,
@@ -1205,7 +1360,8 @@ fn draw_step1_summary(f: &mut ratatui::Frame<'_>, app: &App) {
                  Model parameters:\n\
                  L = {l}, J = {j}, p = {pval}, H = {h}, Init = {init}\n\
                  T scan: start = {ts:.6}, end = {te:.6}, step = {dt:.6}\n\
-                 Tc step = {dtc:.6}\n\n\
+                 Tc step = {dtc:.6}\n\
+                 Outlier filter: {filter}\n\n\
                  Critical points (from Step 1):\n\
                  C(T) peak at T = {c_peak}\n\
                  χ(T) peak at T = {chi_peak}\n\
@@ -1225,6 +1381,7 @@ fn draw_step1_summary(f: &mut ratatui::Frame<'_>, app: &App) {
                 te = params.t_end,
                 dt = params.t_step,
                 dtc = params.tc_step,
+                filter = filter_label,
                 c_peak = c_peak,
                 chi_peak = chi_peak,
                 m_peak = m_peak,
@@ -1464,6 +1621,7 @@ fn handle_key(
                     let (_name, path) = app.saved_runs[app.saved_run_selected].clone();
                     match load_params::load_params_from_summary_dir(&path) {
                         Ok(params) => {
+                            app.outlier_filter = params.use_outlier_filter;
                             app.sim_params = Some(params.clone());
                             app.initial_state = params.initial_state;
                             app.field_buffers[FIELD_L] = params.l.to_string();
@@ -1541,7 +1699,7 @@ fn handle_key(
                     app.mode = AppMode::RunningTcScan { done: 0, total: total_steps };
                     let _ = terminal.draw(|f| draw_frame(f, app));
 
-                    match run_loglog_analysis(&params_for_tc, &results_slice, |done, total| {
+                    match run_loglog_analysis(&params_for_tc, &results_slice, "data", |done, total| {
                         app.mode = AppMode::RunningTcScan { done, total };
                         let _ = terminal.draw(|f| draw_frame(f, app));
                     }) {
@@ -1677,7 +1835,7 @@ fn handle_key(
                     app.mode = AppMode::RunningTcScan { done: 0, total: total_steps };
                     let _ = terminal.draw(|f| draw_frame(f, app));
 
-                    match run_loglog_analysis(&params_for_tc, &results_slice, |done, total| {
+                    match run_loglog_analysis(&params_for_tc, &results_slice, "data", |done, total| {
                         app.mode = AppMode::RunningTcScan { done, total };
                         let _ = terminal.draw(|f| draw_frame(f, app));
                     }) {
@@ -1746,11 +1904,20 @@ fn handle_key(
                     app.error_msg = None;
                 }
 
-                KeyCode::Left if app.selected_field == FIELD_INIT => {
-                    app.initial_state = app.initial_state.prev();
+                KeyCode::Left => {
+                    if app.selected_field == FIELD_INIT {
+                        app.initial_state = app.initial_state.prev();
+                    }
                 }
-                KeyCode::Right if app.selected_field == FIELD_INIT => {
-                    app.initial_state = app.initial_state.next();
+                KeyCode::Right => {
+                    if app.selected_field == FIELD_INIT {
+                        app.initial_state = app.initial_state.next();
+                    }
+                }
+
+                KeyCode::Char('o') => {
+                    app.outlier_filter = !app.outlier_filter;
+                    app.error_msg = None;
                 }
 
                 KeyCode::Char(c) if app.selected_field != FIELD_INIT => {
@@ -1844,6 +2011,10 @@ fn run_app(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("BATCH_MODE").ok().as_deref() == Some("1") {
+        return run_batch_from_env();
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;

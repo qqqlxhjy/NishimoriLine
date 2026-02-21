@@ -174,5 +174,6 @@ pub fn load_params_from_summary_dir(dir: &str) -> Result<SimParams, String> {
         therm_steps,
         stride,
         h,
+        use_outlier_filter: false,
     })
 }
