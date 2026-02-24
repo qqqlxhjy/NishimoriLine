@@ -1,0 +1,34 @@
+Simulation summary
+Timestamp: 20260221_202227
+Output directory: data_batch/batch_20260221_141434/loglog_singleProfile_20260221_202227
+
+Model parameters
+L = 30
+J = 1
+p = 0.36
+H = 0
+Initial state = Random
+Total bonds = 1800
+-J bonds (rigid) = 648
+
+MC parameters
+MC steps   = 500
+Therm steps = 500
+Stride      = 1
+Disorder samples = 8
+
+Scan parameters
+T_start = 1
+T_end   = 4
+T_step  = 0.05
+Tc_step = 0.0001
+
+Auto analysis windows
+T window (envelope) = [1.000000, 2.800000]
+Tc window (overlap)  = [1.000000, 2.800000]
+
+Best Tc from log-log fit
+Tc_best    = 2.80000000
+beta       = 0.06571100
+R_squared  = 0.51969546
+fit_points = 36

@@ -1,0 +1,17 @@
+Nishimori line analysis summary
+Output directory: data3_nishimoriline/nishimori_line_20260224_012544
+
+Input parameters:
+Lattice size L = 30
+Interaction J = 1
+Initial state = Random
+External field h = 0
+p range: start = 0, end = 0.21, step = 0.01
+Curve-2 T range: start = 0.01, end = 4.01, step = 0.2
+MC steps = 1000
+Therm steps = 1000
+Stride = 1
+Disorder samples = 15
+
+Curve-1 points: 22
+Curve-2 points: 22

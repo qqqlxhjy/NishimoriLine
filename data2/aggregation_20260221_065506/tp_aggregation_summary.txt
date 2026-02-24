@@ -1,0 +1,16 @@
+Tc vs p aggregation summary
+Output directory: data2/aggregation_20260221_065506
+
+Per-sample points:
+dir,p,Tc_best
+loglog_singleProfile_20260221_062938,0.010000,2.32000000
+loglog_singleProfile_20260221_043704,0.005000,2.27000000
+loglog_singleProfile_20260221_040702,0.010000,2.28500000
+loglog_singleProfile_20260221_020235,0.010000,2.39920000
+loglog_singleProfile_20260221_020011,0.000000,2.27000000
+
+Grouped statistics by p:
+p,count,mean_Tc,var_Tc
+0.000000,1,2.27000000,0.00000000
+0.005000,1,2.27000000,0.00000000
+0.010000,3,2.33473333,0.00342321

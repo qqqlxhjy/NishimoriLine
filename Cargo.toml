@@ -18,3 +18,7 @@ path = "src/auto_aggregation.rs"
 [[bin]]
 name = "batch-input"
 path = "src/batch_input.rs"
+
+[[bin]]
+name = "nishimoriline"
+path = "src/nishimoriline.rs"

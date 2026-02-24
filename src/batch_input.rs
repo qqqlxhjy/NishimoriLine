@@ -1,6 +1,8 @@
 use std::io::{self, Write, BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::fs;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::thread;
 use chrono::Local;
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -15,6 +17,7 @@ use ratatui::{
     Terminal,
 };
 
+#[derive(Clone)]
 struct BatchParams {
     l: usize,
     j: f64,
@@ -23,6 +26,7 @@ struct BatchParams {
     therm_steps: usize,
     stride: usize,
     sample_count: usize,
+    max_parallel: usize,
     t_start: f64,
     t_end: f64,
     t_step: f64,
@@ -48,6 +52,7 @@ impl Default for BatchParams {
             therm_steps: mc_steps / 2,
             stride: 10,
             sample_count: 1,
+            max_parallel: 4,
             t_start: 1.0,
             t_end: 4.0,
             t_step: 0.1,
@@ -74,14 +79,15 @@ const FIELD_MC_STEPS: usize = 6;
 const FIELD_THERM: usize = 7;
 const FIELD_STRIDE: usize = 8;
 const FIELD_SAMPLE_COUNT: usize = 9;
-const FIELD_P_START: usize = 10;
-const FIELD_P_END: usize = 11;
-const FIELD_P_STEP: usize = 12;
-const FIELD_T_WIN_MIN: usize = 13;
-const FIELD_T_WIN_MAX: usize = 14;
-const FIELD_TC_WIN_MIN: usize = 15;
-const FIELD_TC_WIN_MAX: usize = 16;
-const NUM_FIELDS: usize = 17;
+const FIELD_MAX_PARALLEL: usize = 10;
+const FIELD_P_START: usize = 11;
+const FIELD_P_END: usize = 12;
+const FIELD_P_STEP: usize = 13;
+const FIELD_T_WIN_MIN: usize = 14;
+const FIELD_T_WIN_MAX: usize = 15;
+const FIELD_TC_WIN_MIN: usize = 16;
+const FIELD_TC_WIN_MAX: usize = 17;
+const NUM_FIELDS: usize = 18;
 
 const FIELD_ORDER: [usize; NUM_FIELDS] = [
     FIELD_L,
@@ -94,6 +100,7 @@ const FIELD_ORDER: [usize; NUM_FIELDS] = [
     FIELD_THERM,
     FIELD_STRIDE,
     FIELD_SAMPLE_COUNT,
+    FIELD_MAX_PARALLEL,
     FIELD_P_START,
     FIELD_P_END,
     FIELD_P_STEP,
@@ -123,6 +130,7 @@ impl BatchApp {
         f[FIELD_THERM] = d.therm_steps.to_string();
         f[FIELD_STRIDE] = d.stride.to_string();
         f[FIELD_SAMPLE_COUNT] = d.sample_count.to_string();
+        f[FIELD_MAX_PARALLEL] = d.max_parallel.to_string();
         f[FIELD_P_START] = format!("{}", d.p_start);
         f[FIELD_P_END] = format!("{}", d.p_end);
         f[FIELD_P_STEP] = format!("{}", d.p_step);
@@ -182,6 +190,11 @@ impl BatchApp {
         if sample_count == 0 {
             return Err("Disorder samples must be >= 1".into());
         }
+        let max_parallel = self.fields[FIELD_MAX_PARALLEL].trim().parse::<usize>()
+            .map_err(|_| format!("Max parallel runs must be an integer 1-4, got '{}'", self.fields[FIELD_MAX_PARALLEL]))?;
+        if max_parallel == 0 || max_parallel > 4 {
+            return Err("Max parallel runs must be between 1 and 4".into());
+        }
         let p_start = self.fields[FIELD_P_START].trim().parse::<f64>()
             .map_err(|_| format!("p start must be a number, got '{}'", self.fields[FIELD_P_START]))?;
         let p_end = self.fields[FIELD_P_END].trim().parse::<f64>()
@@ -216,6 +229,7 @@ impl BatchApp {
             therm_steps,
             stride,
             sample_count,
+            max_parallel,
             t_start,
             t_end,
             t_step,
@@ -284,6 +298,7 @@ fn draw_batch_setup(
         (FIELD_THERM, "Therm Steps"),
         (FIELD_STRIDE, "Stride"),
         (FIELD_SAMPLE_COUNT, "Disorder samples"),
+        (FIELD_MAX_PARALLEL, "Max parallel runs"),
         (FIELD_P_START, "p start"),
         (FIELD_P_END, "p end"),
         (FIELD_P_STEP, "p step"),
@@ -297,6 +312,7 @@ fn draw_batch_setup(
         (FIELD_THERM, "Therm Steps"),
         (FIELD_STRIDE, "Stride"),
         (FIELD_SAMPLE_COUNT, "Disorder samples"),
+        (FIELD_MAX_PARALLEL, "Max parallel runs"),
         (FIELD_P_START, "p start"),
         (FIELD_P_END, "p end"),
         (FIELD_P_STEP, "p step"),
@@ -496,6 +512,163 @@ fn run_tui() -> Result<BatchParams, String> {
     }
 }
 
+fn run_single(
+    idx: usize,
+    total: usize,
+    p_val: f64,
+    params: BatchParams,
+    batch_root: String,
+    completed: Arc<AtomicUsize>,
+) {
+    println!();
+    println!(
+        "Starting run {}/{} with p = {:.6}",
+        idx + 1,
+        total,
+        p_val
+    );
+
+    let mut cmd = Command::new("target/release/ising-monte-carlo");
+    cmd.env("BATCH_MODE", "1")
+        .env("BATCH_L", params.l.to_string())
+        .env("BATCH_J", params.j.to_string())
+        .env("BATCH_P", format!("{:.8}", p_val))
+        .env("BATCH_T_START", params.t_start.to_string())
+        .env("BATCH_T_END", params.t_end.to_string())
+        .env("BATCH_T_STEP", params.t_step.to_string())
+        .env("BATCH_MC_STEPS", params.mc_steps.to_string())
+        .env("BATCH_THERM_STEPS", params.therm_steps.to_string())
+        .env("BATCH_STRIDE", params.stride.to_string())
+        .env("BATCH_H", params.h.to_string())
+        .env("BATCH_SAMPLE_COUNT", params.sample_count.to_string())
+        .env("BATCH_INIT", "Random");
+    if params.use_outlier {
+        cmd.env("BATCH_OUTLIER_FILTER", "1");
+    }
+    if params.use_auto_window {
+        cmd.env("BATCH_WINDOW_MODE", "auto");
+    } else {
+        cmd.env("BATCH_WINDOW_MODE", "fixed")
+            .env("BATCH_T_MIN", params.t_win_min.to_string())
+            .env("BATCH_T_MAX", params.t_win_max.to_string())
+            .env("BATCH_TC_MIN", params.tc_win_min.to_string())
+            .env("BATCH_TC_MAX", params.tc_win_max.to_string());
+    }
+    cmd.env("BATCH_OUTPUT_ROOT", &batch_root);
+    cmd.stdout(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            println!(
+                "Failed to start run {}/{} with p = {:.6}: {}",
+                idx + 1,
+                total,
+                p_val,
+                e
+            );
+            return;
+        }
+    };
+
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        let mut sweep_done = 0usize;
+        let mut sweep_total = 0usize;
+        let mut tc_done = 0usize;
+        let mut tc_total = 0usize;
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if let Some(rest) = line.strip_prefix("BATCH_PROGRESS ") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    if parts[0] == "SWEEP" {
+                        if let (Ok(d), Ok(t)) =
+                            (parts[1].parse::<usize>(), parts[2].parse::<usize>())
+                        {
+                            sweep_done = d;
+                            sweep_total = t;
+                        }
+                    } else if parts[0] == "TC" {
+                        if let (Ok(d), Ok(t)) =
+                            (parts[1].parse::<usize>(), parts[2].parse::<usize>())
+                        {
+                            tc_done = d;
+                            tc_total = t;
+                        }
+                    }
+                }
+                let sweep_pct = if sweep_total > 0 {
+                    100.0 * sweep_done as f64 / sweep_total as f64
+                } else {
+                    0.0
+                };
+                let tc_pct = if tc_total > 0 {
+                    100.0 * tc_done as f64 / tc_total as f64
+                } else {
+                    0.0
+                };
+                let already = completed.load(Ordering::SeqCst) as f64;
+                let overall_frac = (already + (tc_done > 0) as u8 as f64) / total as f64;
+                let overall_pct = overall_frac * 100.0;
+                println!(
+                    "Run {}/{} (p = {:.6})\n  Sweep: {:>4}/{:<4} ({:>5.1}%)\n  Tc scan: {:>4}/{:<4} ({:>5.1}%)\n  Overall batch: {:>5.1}%\n",
+                    idx + 1,
+                    total,
+                    p_val,
+                    sweep_done,
+                    sweep_total,
+                    sweep_pct,
+                    tc_done,
+                    tc_total,
+                    tc_pct,
+                    overall_pct
+                );
+            } else if !line.trim().is_empty() {
+                println!("{}", line);
+            }
+        }
+    }
+
+    let status = child.wait();
+
+    match status {
+        Ok(s) if s.success() => {
+            let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+            let frac = done as f64 / total as f64;
+            let percent = frac * 100.0;
+            println!(
+                "Finished run {}/{} (p = {:.6}). Overall progress: {:.1}%",
+                idx + 1,
+                total,
+                p_val,
+                percent
+            );
+        }
+        Ok(s) => {
+            println!(
+                "Run {}/{} with p = {:.6} exited with status {:?}",
+                idx + 1,
+                total,
+                p_val,
+                s.code()
+            );
+        }
+        Err(e) => {
+            println!(
+                "Failed to start run {}/{} with p = {:.6}: {}",
+                idx + 1,
+                total,
+                p_val,
+                e
+            );
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let params = match run_tui() {
         Ok(p) => p,
@@ -523,163 +696,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Total runs: {}", total);
     println!("Starting batch runs...");
 
-    let mut completed = 0usize;
     let batch_ts = Local::now().format("%Y%m%d_%H%M%S");
     let batch_root = format!("data_batch/batch_{}", batch_ts);
     fs::create_dir_all(&batch_root)?;
-    for (idx, p_val) in p_vals.iter().enumerate() {
-        println!();
-        println!(
-            "Starting run {}/{} with p = {:.6}",
-            idx + 1,
-            total,
-            p_val
-        );
-
-        let mut cmd = Command::new("target/debug/ising-monte-carlo");
-        cmd
-            .env("BATCH_MODE", "1")
-            .env("BATCH_L", params.l.to_string())
-            .env("BATCH_J", params.j.to_string())
-            .env("BATCH_P", format!("{:.8}", p_val))
-            .env("BATCH_T_START", params.t_start.to_string())
-            .env("BATCH_T_END", params.t_end.to_string())
-            .env("BATCH_T_STEP", params.t_step.to_string())
-            .env("BATCH_MC_STEPS", params.mc_steps.to_string())
-            .env("BATCH_THERM_STEPS", params.therm_steps.to_string())
-            .env("BATCH_STRIDE", params.stride.to_string())
-            .env("BATCH_H", params.h.to_string())
-            .env("BATCH_SAMPLE_COUNT", params.sample_count.to_string())
-            .env("BATCH_INIT", "Random");
-        if params.use_outlier {
-            cmd.env("BATCH_OUTLIER_FILTER", "1");
+    let completed = Arc::new(AtomicUsize::new(0));
+    let max_parallel = params.max_parallel.max(1).min(4);
+    let mut start_index = 0usize;
+    while start_index < total {
+        let end_index = (start_index + max_parallel).min(total);
+        let mut handles = Vec::new();
+        for (local_idx, p_val) in p_vals[start_index..end_index].iter().enumerate() {
+            let idx = start_index + local_idx;
+            let params_clone = params.clone();
+            let batch_root_clone = batch_root.clone();
+            let completed_clone = completed.clone();
+            let p = *p_val;
+            let handle = thread::spawn(move || {
+                run_single(idx, total, p, params_clone, batch_root_clone, completed_clone);
+            });
+            handles.push(handle);
         }
-        if params.use_auto_window {
-            cmd.env("BATCH_WINDOW_MODE", "auto");
-        } else {
-            cmd.env("BATCH_WINDOW_MODE", "fixed")
-                .env("BATCH_T_MIN", params.t_win_min.to_string())
-                .env("BATCH_T_MAX", params.t_win_max.to_string())
-                .env("BATCH_TC_MIN", params.tc_win_min.to_string())
-                .env("BATCH_TC_MAX", params.tc_win_max.to_string());
+        for handle in handles {
+            let _ = handle.join();
         }
-        cmd.env("BATCH_OUTPUT_ROOT", &batch_root);
-        cmd.stdout(Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                println!(
-                    "Failed to start run {}/{} with p = {:.6}: {}",
-                    idx + 1,
-                    total,
-                    p_val,
-                    e
-                );
-                continue;
-            }
-        };
-
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            let mut sweep_done = 0usize;
-            let mut sweep_total = 0usize;
-            let mut tc_done = 0usize;
-            let mut tc_total = 0usize;
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => break,
-                };
-                if let Some(rest) = line.strip_prefix("BATCH_PROGRESS ") {
-                    let parts: Vec<&str> = rest.split_whitespace().collect();
-                    if parts.len() >= 3 {
-                        if parts[0] == "SWEEP" {
-                            if let (Ok(d), Ok(t)) =
-                                (parts[1].parse::<usize>(), parts[2].parse::<usize>())
-                            {
-                                sweep_done = d;
-                                sweep_total = t;
-                            }
-                        } else if parts[0] == "TC" {
-                            if let (Ok(d), Ok(t)) =
-                                (parts[1].parse::<usize>(), parts[2].parse::<usize>())
-                            {
-                                tc_done = d;
-                                tc_total = t;
-                            }
-                        }
-                    }
-                    let sweep_pct = if sweep_total > 0 {
-                        100.0 * sweep_done as f64 / sweep_total as f64
-                    } else {
-                        0.0
-                    };
-                    let tc_pct = if tc_total > 0 {
-                        100.0 * tc_done as f64 / tc_total as f64
-                    } else {
-                        0.0
-                    };
-                    let overall_frac = (completed as f64 + (tc_done > 0) as u8 as f64)
-                        / total as f64;
-                    let overall_pct = overall_frac * 100.0;
-                    println!(
-                        "Run {}/{} (p = {:.6})\n  Sweep: {:>4}/{:<4} ({:>5.1}%)\n  Tc scan: {:>4}/{:<4} ({:>5.1}%)\n  Overall batch: {:>5.1}%\n",
-                        idx + 1,
-                        total,
-                        p_val,
-                        sweep_done,
-                        sweep_total,
-                        sweep_pct,
-                        tc_done,
-                        tc_total,
-                        tc_pct,
-                        overall_pct
-                    );
-                } else if !line.trim().is_empty() {
-                    println!("{}", line);
-                }
-            }
-        }
-
-        let status = child.wait();
-
-        match status {
-            Ok(s) if s.success() => {
-                completed += 1;
-                let frac = completed as f64 / total as f64;
-                let percent = frac * 100.0;
-                println!(
-                    "Finished run {}/{} (p = {:.6}). Overall progress: {:.1}%",
-                    idx + 1,
-                    total,
-                    p_val,
-                    percent
-                );
-            }
-            Ok(s) => {
-                println!(
-                    "Run {}/{} with p = {:.6} exited with status {:?}",
-                    idx + 1,
-                    total,
-                    p_val,
-                    s.code()
-                );
-            }
-            Err(e) => {
-                println!(
-                    "Failed to start run {}/{} with p = {:.6}: {}",
-                    idx + 1,
-                    total,
-                    p_val,
-                    e
-                );
-            }
-        }
+        start_index = end_index;
     }
 
     println!();
-    println!("Batch runs finished. Completed {}/{} runs.", completed, total);
+    let final_done = completed.load(Ordering::SeqCst);
+    println!("Batch runs finished. Completed {}/{} runs.", final_done, total);
 
     Ok(())
 }
