@@ -1,6 +1,6 @@
-use chrono::Local;
 use plotters::prelude::*;
 use rand::{Rng, seq::SliceRandom};
+use chrono::Local;
 use std::cmp::Ordering;
 use std::fs;
 use std::io::{self, Write};
@@ -46,6 +46,7 @@ struct Params {
     stride: usize,
     disorder_samples: usize,
     initial_state: InitialState,
+    observation_window: Option<(f64, f64)>,
 }
 
 fn read_line(prompt: &str, default: &str) -> String {
@@ -91,6 +92,15 @@ fn read_params() -> Params {
     let stride = parse_usize(&read_line("Stride", "10"), 10);
     let disorder_samples = parse_usize(&read_line("Disorder samples", "8"), 8);
 
+    let observation_str = read_line("Set observation window [pwstart, pwend] for detailed overview? [y/N]", "n");
+    let observation_window = if observation_str.trim().to_lowercase() == "y" {
+        let pw_start = parse_f64(&read_line("Window start (pwstart)", "0.0"), 0.0);
+        let pw_end = parse_f64(&read_line("Window end (pwend)", "0.5"), 0.5);
+        Some((pw_start, pw_end))
+    } else {
+        None
+    };
+
     Params {
         l,
         j,
@@ -106,6 +116,7 @@ fn read_params() -> Params {
         stride,
         disorder_samples,
         initial_state,
+        observation_window,
     }
 }
 
@@ -483,7 +494,7 @@ fn draw_tp_plot(
     Ok(())
 }
 
-fn investigate_p_values(
+fn interactive_investigation(
     params: &Params,
     curve2: &[(f64, f64)],
     out_dir: &str,
@@ -492,61 +503,106 @@ fn investigate_p_values(
         return Ok(());
     }
 
-    println!();
-    println!("Select p values to investigate.");
-    println!("Use 'y' to mark a p for investigation, 'n' to skip.");
-    println!("For each p, you will be asked once.");
+    loop {
+        println!();
+        println!("========================================");
+        println!("       Investigation Menu");
+        println!("========================================");
+        println!("1. Select specific p values manually (iterate list)");
+        println!("2. Select a window [pwstart, pwend] (process all p in range)");
+        println!("3. Finish and Exit");
+        println!("========================================");
+        print!("Enter your choice [1-3]: ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line).is_err() {
+            break;
+        }
+        let choice = line.trim();
 
-    let mut selected = Vec::new();
-    for (p, t_star) in curve2 {
-        loop {
-            print!("Investigate p = {:.6} (best T = {:.6}) ? [y/n]: ", p, t_star);
-            let _ = io::stdout().flush();
-            let mut line = String::new();
-            if io::stdin().read_line(&mut line).is_err() {
+        match choice {
+            "1" => {
+                println!("\n--- Manual Selection ---");
+                println!("Use 'y' to mark a p for investigation, 'n' to skip.");
+                let mut selected = Vec::new();
+                for (p, t_star) in curve2 {
+                    loop {
+                        print!("Investigate p = {:.6} (best T = {:.6}) ? [y/n]: ", p, t_star);
+                        let _ = io::stdout().flush();
+                        let mut input = String::new();
+                        if io::stdin().read_line(&mut input).is_err() {
+                            break;
+                        }
+                        let s = input.trim().to_lowercase();
+                        if s == "y" {
+                            selected.push(*p);
+                            break;
+                        } else if s == "n" {
+                            break;
+                        } else {
+                            println!("Please enter 'y' or 'n'.");
+                        }
+                    }
+                }
+                if !selected.is_empty() {
+                    println!("\nLaunching investigation for {} selected p values (prefix: investigation_p_)...", selected.len());
+                    run_investigation_batch(params, &selected, out_dir, "investigation_p_");
+                } else {
+                    println!("No p values selected.");
+                }
+            }
+            "2" => {
+                println!("\n--- Window Selection ---");
+                let pw_start = parse_f64(&read_line("Window start (pwstart)", "0.0"), 0.0);
+                let pw_end = parse_f64(&read_line("Window end (pwend)", "0.5"), 0.5);
+
+                let mut selected = Vec::new();
+                for (p, _) in curve2 {
+                    if *p >= pw_start - 1e-9 && *p <= pw_end + 1e-9 {
+                        selected.push(*p);
+                    }
+                }
+
+                if !selected.is_empty() {
+                    println!("\nFound {} p values in window [{:.6}, {:.6}].", selected.len(), pw_start, pw_end);
+                    println!("Launching investigation (prefix: w_investigation_p_)...");
+                    run_investigation_batch(params, &selected, out_dir, "w_investigation_p_");
+                } else {
+                    println!("No p values found in the specified window.");
+                }
+            }
+            "3" => {
+                println!("Exiting investigation menu.");
                 break;
             }
-            let s = line.trim().to_lowercase();
-            if s == "y" {
-                selected.push(*p);
-                break;
-            } else if s == "n" {
-                break;
-            } else {
-                println!("Please enter 'y' or 'n'.");
+            _ => {
+                println!("Invalid choice. Please enter 1, 2, or 3.");
             }
         }
-    }
-
-    if selected.is_empty() {
-        return Ok(());
-    }
-
-    println!();
-    println!(
-        "Launching investigations for {} p values in parallel...",
-        selected.len()
-    );
-
-    let mut handles = Vec::new();
-    for p_val in selected {
-        let params_cloned = params.clone();
-        let out_dir_owned = out_dir.to_string();
-        let handle = thread::spawn(move || {
-            run_investigation_for_p(params_cloned, p_val, out_dir_owned);
-        });
-        handles.push(handle);
-    }
-
-    for h in handles {
-        let _ = h.join();
     }
 
     Ok(())
 }
 
-fn run_investigation_for_p(params: Params, p_val: f64, out_dir: String) {
-    println!("Starting investigation for p = {:.6}", p_val);
+fn run_investigation_batch(params: &Params, p_list: &[f64], out_dir: &str, prefix: &str) {
+    let mut handles = Vec::new();
+    for &p_val in p_list {
+        let params_cloned = params.clone();
+        let out_dir_owned = out_dir.to_string();
+        let prefix_owned = prefix.to_string();
+        handles.push(thread::spawn(move || {
+            run_investigation_for_p(params_cloned, p_val, out_dir_owned, prefix_owned);
+        }));
+    }
+
+    for h in handles {
+        let _ = h.join();
+    }
+    println!("Batch investigation finished.");
+}
+
+fn run_investigation_for_p(params: Params, p_val: f64, out_dir: String, folder_prefix: String) {
+    // println!("Starting investigation for p = {:.6}", p_val); // Commented out to reduce noise in parallel
     let mut rng = rand::thread_rng();
     let mut temps = Vec::new();
     let mut e_vals = Vec::new();
@@ -638,7 +694,7 @@ fn run_investigation_for_p(params: Params, p_val: f64, out_dir: String) {
         t += params.t_step_curve2;
     }
 
-    let inv_dir = format!("{}/investigation_p_{:.6}", out_dir, p_val);
+    let inv_dir = format!("{}/{}{:.6}", out_dir, folder_prefix, p_val);
     if let Err(e) = fs::create_dir_all(&inv_dir) {
         println!(
             "Failed to create investigation dir for p = {:.6}: {}",
@@ -783,8 +839,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writeln!(f)?;
     writeln!(f, "Curve-1 points: {}", curve1.len())?;
     writeln!(f, "Curve-2 points: {}", curve2.len())?;
+    
+    if let Some((pw_start, pw_end)) = params.observation_window {
+        writeln!(f, "Observation window: [{:.6}, {:.6}]", pw_start, pw_end)?;
+        
+        println!();
+        println!("Starting detailed observation for window [{:.6}, {:.6}]...", pw_start, pw_end);
+        let mut selected = Vec::new();
+        for (p, _) in &curve2 {
+            if *p >= pw_start - 1e-9 && *p <= pw_end + 1e-9 {
+                selected.push(*p);
+            }
+        }
+        
+        if !selected.is_empty() {
+            println!("Found {} p values in observation window. Launching parallel generation of overview plots (prefix: w_)...", selected.len());
+            // Important: This does NOT affect the main curve2 data or plot.
+            // It only generates additional detailed overview plots for the selected p values.
+            run_investigation_batch(&params, &selected, &out_dir, "w_observation_p_");
+        } else {
+            println!("No p values found in the specified observation window.");
+        }
+    }
 
-    investigate_p_values(&params, &curve2, &out_dir)?;
+    interactive_investigation(&params, &curve2, &out_dir)?;
 
     println!();
     println!("Analysis written to directory: {}", out_dir);
