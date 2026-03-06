@@ -47,6 +47,13 @@ struct Params {
     disorder_samples: usize,
     initial_state: InitialState,
     observation_window: Option<(f64, f64)>,
+    mode: Mode,
+}
+
+#[derive(Clone, PartialEq)]
+enum Mode {
+    Search,
+    FullScan,
 }
 
 fn read_line(prompt: &str, default: &str) -> String {
@@ -73,6 +80,16 @@ fn parse_f64(input: &str, default: f64) -> f64 {
 }
 
 fn read_params() -> Params {
+    println!("Select Operation Mode:");
+    println!("1. Nishimori Line Search (Standard)");
+    println!("2. Full 3D Scan (p, T, E, M)");
+    let mode_str = read_line("Choice [1/2]", "1");
+    let mode = if mode_str.trim() == "2" {
+        Mode::FullScan
+    } else {
+        Mode::Search
+    };
+
     let l = parse_usize(&read_line("Lattice size L", "32"), 32);
     let j = parse_f64(&read_line("Interaction J", "1.0"), 1.0);
     let h = parse_f64(&read_line("External field h", "0.0"), 0.0);
@@ -117,6 +134,7 @@ fn read_params() -> Params {
         disorder_samples,
         initial_state,
         observation_window,
+        mode,
     }
 }
 
@@ -314,6 +332,88 @@ fn compute_curve1(params: &Params) -> Vec<(f64, f64)> {
         }
         p += params.p_step;
     }
+    res
+}
+
+fn measure_energy_and_magnetization(params: &Params, p: f64, t: f64, rng: &mut impl Rng) -> (f64, f64) {
+    let n = (params.l * params.l) as f64;
+    let samples = params.disorder_samples.max(1);
+    let mut e_acc = 0.0;
+    let mut m_acc = 0.0;
+
+    for _ in 0..samples {
+        let mut model = IsingModel::new_with_state(params.l, params.j, p, params.h, t, params.initial_state, rng);
+
+        for _ in 0..params.therm_steps {
+            for _ in 0..params.l * params.l {
+                model.metropolis_step(rng);
+            }
+        }
+
+        let mut e_samples = Vec::new();
+        let mut m_samples = Vec::new();
+        for step in 0..params.mc_steps {
+            for _ in 0..params.l * params.l {
+                model.metropolis_step(rng);
+            }
+            if step % params.stride == 0 {
+                e_samples.push(model.total_energy());
+                m_samples.push(model.total_magnetization().abs() as f64);
+            }
+        }
+
+        e_acc += mean(&e_samples) / n;
+        m_acc += mean(&m_samples) / n;
+    }
+
+    (e_acc / samples as f64, m_acc / samples as f64)
+}
+
+fn compute_full_scan(params: &Params) -> Vec<(f64, f64, f64, f64, f64)> {
+    let mut res = Vec::new();
+    if params.p_step <= 0.0 || params.t_step_curve2 <= 0.0 {
+        return res;
+    }
+    let mut rng = rand::thread_rng();
+
+    let mut total_points = 0usize;
+    let mut p = params.p_start;
+    while p <= params.p_end + 1e-9 {
+        let mut t = params.t_start_curve2;
+        while t <= params.t_end_curve2 + 1e-9 {
+            total_points += 1;
+            t += params.t_step_curve2;
+        }
+        p += params.p_step;
+    }
+
+    if total_points == 0 {
+        return res;
+    }
+
+    println!("Full 3D Scan: starting MC scan over {} (p, T) points...", total_points);
+    let mut done_points = 0usize;
+
+    let mut p = params.p_start;
+    while p <= params.p_end + 1e-9 {
+        let mut t = params.t_start_curve2;
+        while t <= params.t_end_curve2 + 1e-9 {
+            let (u_mc, m_mc) = measure_energy_and_magnetization(params, p, t, &mut rng);
+            let u_th = ferromagnet_energy(params.j, t);
+            res.push((p, t, u_mc, m_mc, u_th));
+
+            done_points += 1;
+            if done_points % 10 == 0 || done_points == total_points {
+                let pct = 100.0 * done_points as f64 / total_points as f64;
+                print!("\rFull Scan progress: {:>6.2}% ({}/{})", pct, done_points, total_points);
+                let _ = io::stdout().flush();
+            }
+
+            t += params.t_step_curve2;
+        }
+        p += params.p_step;
+    }
+    println!();
     res
 }
 
@@ -796,9 +896,102 @@ fn run_investigation_for_p(params: Params, p_val: f64, out_dir: String, folder_p
     println!("Investigation for p = {:.6} finished.", p_val);
 }
 
+fn draw_3d_scatter(
+    data: &[(f64, f64, f64)], // x=p, y=val, z=T
+    path: &str,
+    title: &str,
+    _y_label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let x_min = data.iter().map(|d| d.0).fold(f64::INFINITY, f64::min);
+    let x_max = data.iter().map(|d| d.0).fold(f64::NEG_INFINITY, f64::max);
+    let y_min = data.iter().map(|d| d.1).fold(f64::INFINITY, f64::min);
+    let y_max = data.iter().map(|d| d.1).fold(f64::NEG_INFINITY, f64::max);
+    let z_min = data.iter().map(|d| d.2).fold(f64::INFINITY, f64::min);
+    let z_max = data.iter().map(|d| d.2).fold(f64::NEG_INFINITY, f64::max);
+
+    // Add some padding
+    let x_pad = (x_max - x_min).abs() * 0.05 + 1e-6;
+    let y_pad = (y_max - y_min).abs() * 0.05 + 1e-6;
+    let z_pad = (z_max - z_min).abs() * 0.05 + 1e-6;
+
+    let root = BitMapBackend::new(path, (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    // p on X, T on Z, Value on Y (Vertical)
+    // build_cartesian_3d(x_range, y_range, z_range)
+    let mut chart = ChartBuilder::on(&root)
+        .caption(title, ("sans-serif", 20).into_font())
+        .margin(20)
+        .build_cartesian_3d(
+            (x_min - x_pad)..(x_max + x_pad),
+            (y_min - y_pad)..(y_max + y_pad),
+            (z_min - z_pad)..(z_max + z_pad),
+        )?;
+
+    chart.configure_axes()
+        .x_formatter(&|x| format!("{:.2}", x))
+        .y_formatter(&|y| format!("{:.2}", y))
+        .z_formatter(&|z| format!("{:.2}", z))
+        .draw()?;
+
+    chart.draw_series(
+        data.iter().map(|(x, y, z)| {
+             Circle::new((*x, *y, *z), 2, BLUE.filled())
+        })
+    )?;
+
+    root.present()?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Nishimori line analysis: Curve-1 theory vs Curve-2 from fresh MC u_MC(T,p)");
     let params = read_params();
+
+    if params.mode == Mode::FullScan {
+        let scan_data = compute_full_scan(&params);
+        let out_root = "data3_nishimoriline";
+        fs::create_dir_all(out_root)?;
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+        let out_dir = format!("{}/full_scan_{}", out_root, timestamp);
+        fs::create_dir_all(&out_dir)?;
+        
+        let path = format!("{}/scan_results.csv", out_dir);
+        let mut f = fs::File::create(&path)?;
+        writeln!(f, "p,T,u_mc,m_mc,u_th,delta_u")?;
+        
+        let mut data_m = Vec::new();
+        let mut data_delta_u = Vec::new();
+
+        for (p, t, u, m, u_th) in scan_data {
+            let delta_u = (u - u_th).abs();
+            writeln!(f, "{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}", p, t, u, m, u_th, delta_u)?;
+            
+            // For 3D plot: p (x), val (y), T (z)
+            data_m.push((p, m, t)); 
+            data_delta_u.push((p, delta_u, t));
+        }
+        println!("Full scan data written to {}", path);
+
+        let path_m = format!("{}/3d_magnetization.png", out_dir);
+        if let Err(e) = draw_3d_scatter(&data_m, &path_m, "Magnetization M(p, T)", "M") {
+             println!("Failed to draw 3D M plot: {}", e);
+        } else {
+             println!("3D M plot written to {}", path_m);
+        }
+
+        let path_u = format!("{}/3d_energy_deviation.png", out_dir);
+        if let Err(e) = draw_3d_scatter(&data_delta_u, &path_u, "Energy Deviation |U_mc - U_th|(p, T)", "Delta U") {
+             println!("Failed to draw 3D Delta U plot: {}", e);
+        } else {
+             println!("3D Delta U plot written to {}", path_u);
+        }
+
+        return Ok(());
+    }
 
     let curve1 = compute_curve1(&params);
     if curve1.is_empty() {
